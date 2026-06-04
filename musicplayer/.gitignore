@@ -3,28 +3,27 @@ logs
 *.log
 npm-debug.log*
 yarn-debug.log*
+yarn-error.log*
 pnpm-debug.log*
+lerna-debug.log*
 
-# JavaScript build output
 node_modules
 dist
 dist-ssr
 *.local
 
-# Tauri/Rust build output
-debug
-target
+# Tauri/Rust
 src-tauri/target
-**/src-tauri/target
+target
+debug
 **/*.rs.bk
 *.pdb
-**/mutants.out*/
 
-# OS and editor files
-.DS_Store
-.idea
+# Editor directories and files
 .vscode/*
 !.vscode/extensions.json
+.idea
+.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
