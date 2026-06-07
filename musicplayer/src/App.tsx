@@ -782,6 +782,10 @@ function VisualizerCanvas({
     vocalWave: [],
     melodyWave: [],
     scopeWave: [],
+    scopeCeiling: 0.45,
+    scopeFloor: 0.02,
+    analyzerCeiling: 0.18,
+    analyzerFloor: 0.02,
     phase: 0,
     lastTime: 0,
   });
@@ -841,6 +845,10 @@ type VisualizerRenderState = {
   vocalWave: number[];
   melodyWave: number[];
   scopeWave: number[];
+  scopeCeiling: number;
+  scopeFloor: number;
+  analyzerCeiling: number;
+  analyzerFloor: number;
   phase: number;
   lastTime: number;
 };
@@ -855,6 +863,7 @@ function drawVisualizer(
   renderState: VisualizerRenderState,
   now: number,
 ) {
+  ensureVisualizerStateDefaults(renderState);
   const palette = getPalette(theme);
   const dt = renderState.lastTime > 0 ? Math.min(0.05, (now - renderState.lastTime) / 1000) : 1 / 60;
   renderState.lastTime = now;
@@ -955,23 +964,49 @@ function drawVisualizer(
     return;
   }
 
-  bins.forEach((target, index) => {
-    const current = smoothedBars[index] ?? 0;
+  const peakBins = selectVisualizerBands(frame.peaks, bandCount, mode);
+  const waveformBands = selectWaveformEnvelopeBands(frame.waveform, bandCount, mode);
+  const analyzerTargets = bins.map((target, index) => {
     const center = (bins.length - 1) / 2;
     const centerWeight = mode === "classicBars" || mode === "windowsScope"
       ? Math.max(0, 1 - Math.abs(index - center) / Math.max(1, center))
       : 0;
-    const bassLift = Math.pow(frame.bassPulse ?? 0, 1.8) * centerWeight * 0.26;
-    const melodicLift = frame.mids * (1 - centerWeight) * 0.08;
-    const shapedTarget = Math.min(1, target * (mode === "windowsScope" ? 0.95 : 1.04) + bassLift + melodicLift);
-    const attack = shapedTarget > current ? 0.24 : 0.075;
+    const peakTarget = peakBins[index] ?? 0;
+    const waveformTarget = waveformBands[index] ?? 0;
+    const bassLift = Math.pow(frame.bassPulse ?? 0, 1.8) * centerWeight * 0.28;
+    const melodicLift = frame.mids * (1 - centerWeight) * 0.09;
+    const levelLift = frame.volume * 0.035;
+    const frequencyTarget = target * (mode === "windowsScope" ? 1.05 : 1.16) + peakTarget * 0.54;
+    const motionTarget = waveformTarget * (mode === "windowsScope" ? 0.6 : 0.72);
+    return Math.max(0, frequencyTarget, motionTarget + levelLift, frequencyTarget + bassLift + melodicLift + levelLift);
+  });
+  const audibleEnergy = Math.max(frame.volume, frame.bassPulse ?? 0, frame.mids, frame.treble);
+  const analyzerPeak = Math.max(0.012, audibleEnergy * 0.36, ...analyzerTargets);
+  const analyzerFloor = percentile(analyzerTargets, 0.15);
+  renderState.analyzerCeiling += (analyzerPeak - renderState.analyzerCeiling) * (analyzerPeak > renderState.analyzerCeiling ? 0.34 : 0.24);
+  renderState.analyzerFloor += (analyzerFloor - renderState.analyzerFloor) * 0.16;
+  const analyzerAdaptiveCeiling = Math.max(0.035, Math.min(renderState.analyzerCeiling, analyzerPeak * 1.42 + 0.022));
+  const analyzerAdaptiveFloor = Math.min(renderState.analyzerFloor * 0.42, analyzerAdaptiveCeiling * 0.16);
+  const analyzerRange = Math.max(0.024, analyzerAdaptiveCeiling - analyzerAdaptiveFloor);
+
+  analyzerTargets.forEach((target, index) => {
+    const current = smoothedBars[index] ?? 0;
+    const normalized = Math.min(1, Math.max(0, (target - analyzerAdaptiveFloor) / analyzerRange));
+    const waveformDetail = waveformBands[index] ?? 0;
+    const detailFloor = audibleEnergy > 0.001
+      ? Math.min(0.34, 0.045 + audibleEnergy * 4.2 + waveformDetail * 0.22)
+      : 0;
+    const shapedTarget = Math.max(detailFloor, Math.pow(normalized, mode === "windowsScope" ? 0.9 : 0.78) * 0.98);
+    const attack = shapedTarget > current ? 0.42 : 0.16;
     const smoothed = current + (shapedTarget - current) * attack;
     smoothedBars[index] = smoothed;
     peakBars[index] = Math.max(smoothed, (peakBars[index] ?? 0) - 0.012);
 
     const x = paddingX + index * (barWidth + barGap);
     const barHeight = Math.max(0, smoothed * usableHeight);
-    const blockCount = Math.floor(barHeight / (blockHeight + blockGap));
+    const blockCount = smoothed > 0.012
+      ? Math.max(1, Math.floor(barHeight / (blockHeight + blockGap)))
+      : 0;
     for (let block = 0; block < blockCount; block += 1) {
       const y = floorY - (block + 1) * (blockHeight + blockGap);
       const heat = block / Math.max(1, Math.floor(usableHeight / (blockHeight + blockGap)));
@@ -987,6 +1022,21 @@ function drawVisualizer(
     context.fillStyle = palette.peak;
     context.fillRect(x, Math.max(10, peakY), barWidth, mode === "windowsScope" ? 1 : 2);
   });
+}
+
+function ensureVisualizerStateDefaults(renderState: VisualizerRenderState) {
+  if (!Number.isFinite(renderState.scopeCeiling)) {
+    renderState.scopeCeiling = 0.45;
+  }
+  if (!Number.isFinite(renderState.scopeFloor)) {
+    renderState.scopeFloor = 0.02;
+  }
+  if (!Number.isFinite(renderState.analyzerCeiling)) {
+    renderState.analyzerCeiling = 0.18;
+  }
+  if (!Number.isFinite(renderState.analyzerFloor)) {
+    renderState.analyzerFloor = 0.02;
+  }
 }
 
 function drawAnalyzerDeckMotion(
@@ -1673,7 +1723,17 @@ function drawWaveform(
 ) {
   const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.25);
   const bins = selectCenterOutBands(frame.frequencyBins, 96);
-  const songFlow = Math.min(1, frame.bass * 0.32 + frame.mids * 0.34 + frame.treble * 0.28 + bassAccent * 0.22);
+  const orderedBins = trimVisualizerBins(frame.frequencyBins);
+  const riffBand = averageRange(orderedBins, 0.34, 0.76);
+  const riffPeak = averageRange(frame.peaks, 0.34, 0.76);
+  const vocalBand = averageRange(frame.vocalBins?.length ? frame.vocalBins : orderedBins, 0.22, 0.72);
+  const waveformDelta = averageWaveformDelta(frame.waveform);
+  const riffEnergy = Math.min(1, riffBand * 0.82 + riffPeak * 0.44 + waveformDelta * 0.5 + frame.treble * 0.16);
+  const vocalFlow = Math.min(1, vocalBand * 0.82 + frame.mids * 0.48 - waveformDelta * 0.16);
+  const rhythmPunch = Math.min(1, bassAccent * 0.52 + waveformDelta * 0.68 + riffPeak * 0.24);
+  const riffFocus = riffEnergy / Math.max(0.001, riffEnergy + vocalFlow);
+  const vocalFocus = 1 - riffFocus;
+  const songFlow = Math.min(1, frame.bass * 0.26 + frame.mids * 0.28 + frame.treble * 0.22 + bassAccent * 0.16 + riffEnergy * 0.32);
   const centerY = height / 2;
   const centerX = width / 2;
 
@@ -1717,8 +1777,7 @@ function drawWaveform(
   const barWidth = Math.max(3, (contentWidth - barGap * (barCount - 1)) / barCount);
   const maxBarHeight = height * 0.24;
 
-  context.shadowBlur = 10 + songFlow * 8;
-  for (let index = 0; index < barCount; index += 1) {
+  const rawTargets = Array.from({ length: barCount }, (_, index) => {
     const t = index / Math.max(1, barCount - 1);
     const sampleIndex = Math.round(t * Math.max(0, frame.waveform.length - 1));
     const raw = Math.abs(smoothedWaveSample(frame.waveform, sampleIndex, 1));
@@ -1728,16 +1787,46 @@ function drawWaveform(
     const band = bins[Math.min(bins.length - 1, Math.floor(t * bins.length))] ?? 0;
     const edgeShape = Math.pow(Math.abs(t - 0.5) * 2, 1.15);
     const sideLift = t < 0.18 ? (0.18 - t) * 2.2 * (frame.bass + bassAccent) : t > 0.68 ? (t - 0.68) * 1.25 * (frame.mids + frame.treble) : 0;
-    const target = Math.min(1, raw * 2.2 + band * 0.38 + transient * 0.34 + sideLift * 0.12 + edgeShape * 0.035);
+    const midFocus = Math.max(0, 1 - Math.abs(t - 0.58) / 0.36);
+    const riffComb = index % 3 === 0 ? 0.12 : index % 3 === 1 ? 0.04 : 0;
+    const riffLift = riffEnergy * midFocus * (0.22 + riffComb) + transient * riffFocus * 0.24;
+    const vocalLift = vocalFlow * Math.max(0, 1 - Math.abs(t - 0.5) / 0.5) * 0.11;
+    return Math.max(
+      0,
+      raw * (1.25 + riffFocus * 0.22)
+        + band * (0.2 + riffFocus * 0.12)
+        + transient * (0.18 + rhythmPunch * 0.14)
+        + sideLift * 0.08
+        + edgeShape * 0.018
+        + riffLift * 0.62
+        + vocalLift * 0.54,
+    );
+  });
+  const framePeak = Math.max(0.04, ...rawTargets);
+  const frameFloor = percentile(rawTargets, 0.18);
+  renderState.scopeCeiling += (framePeak - renderState.scopeCeiling) * (framePeak > renderState.scopeCeiling ? 0.2 : 0.035);
+  renderState.scopeFloor += (frameFloor - renderState.scopeFloor) * 0.08;
+  const adaptiveFloor = Math.min(renderState.scopeFloor * 0.82, renderState.scopeCeiling * 0.42);
+  const adaptiveRange = Math.max(0.08, renderState.scopeCeiling - adaptiveFloor);
+
+  context.shadowBlur = 10 + songFlow * 8;
+  for (let index = 0; index < barCount; index += 1) {
+    const t = index / Math.max(1, barCount - 1);
+    const midFocus = Math.max(0, 1 - Math.abs(t - 0.58) / 0.36);
+    const normalized = Math.min(1, Math.max(0, (rawTargets[index] - adaptiveFloor) / adaptiveRange));
+    const target = Math.pow(normalized, 1.28 - riffFocus * 0.18) * (0.84 + rhythmPunch * 0.12);
     const current = renderState.scopeWave[index] ?? 0;
-    const value = current + (target - current) * (target > current ? 0.56 : 0.18);
+    const attack = target > current ? 0.48 + riffFocus * 0.22 + rhythmPunch * 0.08 : 0.16 + vocalFocus * 0.05;
+    const value = current + (target - current) * attack;
     renderState.scopeWave[index] = value;
 
     const x = startX + index * (barWidth + barGap);
     const barHeight = Math.max(3, value * maxBarHeight);
-    const hue = lerpColor("#19ffd5", "#ff3fb7", t);
-    const glow = t < 0.5 ? "#00ffd0" : "#ff4abf";
-    const capGlow = alphaColor("#fff3c4", 0.24 + value * 0.34);
+    const riffColor = lerpColor("#ffe36e", "#ff5a3f", Math.min(1, riffFocus * midFocus));
+    const baseHue = lerpColor("#19ffd5", "#ff3fb7", t);
+    const hue = lerpColor(baseHue, riffColor, riffFocus * midFocus * 0.42);
+    const glow = riffFocus * midFocus > 0.45 ? "#ffd45f" : t < 0.5 ? "#00ffd0" : "#ff4abf";
+    const capGlow = alphaColor(riffFocus * midFocus > 0.42 ? "#fff0a8" : "#fff3c4", 0.22 + value * 0.32 + rhythmPunch * 0.08);
 
     context.shadowColor = glow;
     context.fillStyle = hue;
@@ -1754,8 +1843,8 @@ function drawWaveform(
   context.shadowBlur = 0;
 
   const pulse = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, width * 0.42);
-  pulse.addColorStop(0, alphaColor("#00ffd0", 0.04 + bassAccent * 0.035));
-  pulse.addColorStop(0.45, alphaColor("#ff3fb7", 0.018 + songFlow * 0.035));
+  pulse.addColorStop(0, alphaColor("#00ffd0", 0.035 + bassAccent * 0.03 + vocalFlow * 0.025));
+  pulse.addColorStop(0.45, alphaColor(riffFocus > 0.52 ? "#ffd45f" : "#ff3fb7", 0.018 + songFlow * 0.03 + riffEnergy * 0.025));
   pulse.addColorStop(1, "rgba(0,0,0,0)");
   context.globalCompositeOperation = "screen";
   context.fillStyle = pulse;
@@ -1944,6 +2033,56 @@ function selectMirroredCenterBands(source: number[], bandCount: number) {
     const edgeShelf = 0.82 + (1 - edgeDistance) * 0.22;
     return Math.min(1, (centerOut[centerOutIndex] ?? 0) * edgeShelf);
   });
+}
+
+function selectWaveformEnvelopeBands(source: number[], bandCount: number, mode: VisualizerMode) {
+  if (source.length === 0) return Array.from({ length: bandCount }, () => 0);
+  const samplesPerBand = Math.max(1, Math.floor(source.length / bandCount));
+  const rawBands = Array.from({ length: bandCount }, (_, band) => {
+    const start = Math.floor((band / bandCount) * source.length);
+    const end = Math.min(source.length, Math.max(start + 1, start + samplesPerBand));
+    let peak = 0;
+    let total = 0;
+    for (let index = start; index < end; index += 1) {
+      const sample = Math.abs(source[index] ?? 0);
+      peak = Math.max(peak, sample);
+      total += sample;
+    }
+    const average = total / Math.max(1, end - start);
+    return Math.min(1, peak * 1.28 + average * 1.1);
+  });
+
+  if (mode === "classicBars" || mode === "windowsScope") {
+    return selectMirroredCenterBands(rawBands, bandCount);
+  }
+  return rawBands;
+}
+
+function averageRange(source: number[], startRatio: number, endRatio: number) {
+  if (source.length === 0) return 0;
+  const start = Math.max(0, Math.min(source.length - 1, Math.floor(source.length * startRatio)));
+  const end = Math.max(start + 1, Math.min(source.length, Math.ceil(source.length * endRatio)));
+  let total = 0;
+  for (let index = start; index < end; index += 1) {
+    total += source[index] ?? 0;
+  }
+  return total / Math.max(1, end - start);
+}
+
+function percentile(source: number[], ratio: number) {
+  if (source.length === 0) return 0;
+  const sorted = source.slice().sort((left, right) => left - right);
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * ratio)));
+  return sorted[index] ?? 0;
+}
+
+function averageWaveformDelta(samples: number[]) {
+  if (samples.length < 2) return 0;
+  let total = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    total += Math.abs((samples[index] ?? 0) - (samples[index - 1] ?? 0));
+  }
+  return Math.min(1, (total / (samples.length - 1)) * 9);
 }
 
 function getBarColor(
