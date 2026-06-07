@@ -56,4 +56,16 @@ export type VisualizerMode =
   | "radial"
   | "windowsScope"
   | "waveform";
-export type AppTheme = "phosphor" | "amber" | "ice";
+export type SongMetadataInput = {
+  title?: string | null;
+  artist?: string | null;
+  album?: string | null;
+  albumArtist?: string | null;
+  genre?: string | null;
+  year?: number | null;
+  trackNumber?: number | null;
+  discNumber?: number | null;
+  coverArtPath?: string | null;
+};
+
+export type AppTheme = "lapis" | "phosphor" | "amber" | "ice";

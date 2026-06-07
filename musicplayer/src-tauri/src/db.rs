@@ -40,6 +40,7 @@ pub struct SongMetadataInput {
     pub year: Option<i64>,
     pub track_number: Option<i64>,
     pub disc_number: Option<i64>,
+    pub cover_art_path: Option<String>,
 }
 
 pub struct Database {
@@ -235,9 +236,10 @@ impl Database {
                   year = ?6,
                   track_number = ?7,
                   disc_number = ?8,
+                  cover_art_path = ?9,
                   metadata_source = 'manual',
-                  updated_at = ?9
-                WHERE id = ?10
+                  updated_at = ?10
+                WHERE id = ?11
                 ",
                 params![
                     metadata.title,
@@ -248,6 +250,7 @@ impl Database {
                     metadata.year,
                     metadata.track_number,
                     metadata.disc_number,
+                    metadata.cover_art_path,
                     now,
                     song_id,
                 ],
@@ -256,6 +259,31 @@ impl Database {
 
         self.get_song(song_id)?
             .ok_or_else(|| "Song not found after metadata update".to_string())
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "
+                INSERT INTO app_settings (key, value)
+                VALUES (?1, ?2)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                ",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| err.to_string())
     }
 }
 

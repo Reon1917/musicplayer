@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "musicplayer",
+  "productName": "Lapis Player",
   "version": "0.1.0",
   "identifier": "com.reon.musicplayer",
   "build": {
@@ -12,12 +12,18 @@
   "app": {
     "windows": [
       {
-        "title": "musicplayer",
-        "width": 800,
-        "height": 600
+        "title": "Lapis Player",
+        "width": 1240,
+        "height": 860,
+        "minWidth": 980,
+        "minHeight": 720
       }
     ],
     "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/album-art/**"]
+      },
       "csp": null
     }
   },

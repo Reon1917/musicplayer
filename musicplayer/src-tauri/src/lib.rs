@@ -2,11 +2,16 @@ mod audio;
 mod db;
 mod scanner;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use audio::{Player, PlayerStatus, VisualizerFrame};
 use db::{Database, Song, SongMetadataInput};
+use image::{imageops::FilterType, ImageFormat};
 use tauri::{AppHandle, Manager, State};
+use uuid::Uuid;
 
 struct AppState {
     db: Mutex<Database>,
@@ -18,12 +23,45 @@ fn scan_music_folder(path: String, state: State<'_, AppState>) -> Result<Vec<Son
     let songs = scanner::scan_music_folder(&path)?;
     let db = state.db.lock().map_err(|err| err.to_string())?;
     db.upsert_songs(&songs)?;
+    db.set_setting("last_music_folder", &path)?;
     db.get_songs()
 }
 
 #[tauri::command]
 fn get_songs(state: State<'_, AppState>) -> Result<Vec<Song>, String> {
     state.db.lock().map_err(|err| err.to_string())?.get_songs()
+}
+
+#[tauri::command]
+fn rescan_music_folder(state: State<'_, AppState>) -> Result<Vec<Song>, String> {
+    let db = state.db.lock().map_err(|err| err.to_string())?;
+    let path = db
+        .get_setting("last_music_folder")?
+        .ok_or_else(|| "Choose a music folder before rescanning.".to_string())?;
+    let songs = scanner::scan_music_folder(&path)?;
+    db.upsert_songs(&songs)?;
+    db.get_songs()
+}
+
+#[tauri::command]
+fn import_album_art(source_path: String, app: AppHandle) -> Result<String, String> {
+    let source = PathBuf::from(source_path);
+    if !source.exists() {
+        return Err("Selected album art file does not exist.".to_string());
+    }
+
+    let art_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("Failed to resolve app data directory: {err}"))?
+        .join("album-art");
+    std::fs::create_dir_all(&art_dir)
+        .map_err(|err| format!("Failed to create album art directory: {err}"))?;
+
+    let file_name = format!("{}.jpg", Uuid::new_v4());
+    let output_path = art_dir.join(file_name);
+    normalize_album_art(&source, &output_path)?;
+    Ok(output_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -127,6 +165,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_music_folder,
             get_songs,
+            rescan_music_folder,
+            import_album_art,
             update_song_metadata,
             play_song,
             preload_song,
@@ -140,4 +180,13 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn normalize_album_art(source: &Path, output_path: &Path) -> Result<(), String> {
+    let image = image::open(source)
+        .map_err(|err| format!("Failed to read album art image: {err}"))?
+        .resize_to_fill(1024, 1024, FilterType::Lanczos3);
+    image
+        .save_with_format(output_path, ImageFormat::Jpeg)
+        .map_err(|err| format!("Failed to save optimized album art: {err}"))
 }

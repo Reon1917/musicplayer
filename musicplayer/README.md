@@ -1,14 +1,15 @@
-# Localamp
+# Lapis Player
 
-A lightweight Tauri v2 music player with a compact Winamp-inspired interface, local SQLite library, Rust playback, and real PCM/FFT-driven visualizers.
+A lightweight Tauri v2 music player with a deep blue steel retro interface, local SQLite library, Rust playback, editable metadata, optimized album art, and real PCM/FFT-driven visualizers.
 
 ## Current Scope
 
 - macOS-first Tauri desktop app.
 - React + TypeScript frontend.
 - Rust backend for folder scanning, SQLite persistence, audio decoding/playback, and visualizer events.
-- Manual folder rescans for `.mp3` and `.wav`.
-- Metadata is read from files and stored in SQLite. Manual metadata edits are stored as local overrides, not written back to source audio files.
+- Manual folder import and one-click rescans for `.mp3` and `.wav`.
+- Metadata is read from files and stored in SQLite. Manual metadata edits and album art are stored as local overrides, not written back to source audio files.
+- Uploaded album art is normalized to a 1024 x 1024 JPEG in app storage for consistent display and optimization.
 - Visualizer modes: spectrum bars and oscilloscope waveform.
 - Settings modal for visualizer mode and app theme.
 
@@ -23,7 +24,7 @@ pnpm install
 Run the app:
 
 ```bash
-pnpm tauri dev
+pnpm run desktop
 ```
 
 Build the frontend:

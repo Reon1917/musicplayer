@@ -5,8 +5,12 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   FolderOpen,
+  ImagePlus,
   Pause,
+  PencilLine,
   Play,
+  RefreshCw,
+  Save,
   Search,
   Settings,
   SkipBack,
@@ -14,6 +18,7 @@ import {
   Square,
   Volume2,
   Waves,
+  X,
 } from "lucide-react";
 import clsx from "clsx";
 import "./App.css";
@@ -22,30 +27,36 @@ import type {
   AppTheme,
   PlayerStatus,
   Song,
+  SongMetadataInput,
   VisualizerFrame,
   VisualizerMode,
 } from "./types";
 
 const themes: Array<{ id: AppTheme; label: string }> = [
+  { id: "lapis", label: "Lapis Steel" },
   { id: "phosphor", label: "Phosphor" },
   { id: "amber", label: "Amber CRT" },
   { id: "ice", label: "Ice LCD" },
 ];
 
 const visualizers: Array<{ id: VisualizerMode; label: string }> = [
-  { id: "trapNation", label: "Trap Pulse" },
-  { id: "wmpRibbons", label: "WMP Ribbons" },
-  { id: "plasmaStorm", label: "Plasma Storm" },
-  { id: "spectrumRing", label: "Spectrum Ring" },
   { id: "classicBars", label: "Winamp Bars" },
-  { id: "centerStereo", label: "Center Stereo" },
-  { id: "radial", label: "Radial Deck" },
   { id: "windowsScope", label: "Old Windows" },
   { id: "waveform", label: "Oscilloscope" },
 ];
 
+const activeVisualizerIds = visualizers.map((item) => item.id);
+
 const isTauriRuntime =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+type MetadataDraft = {
+  title: string;
+  artist: string;
+  genre: string;
+  year: string;
+  coverArtPath: string | null;
+};
 
 function App() {
   const {
@@ -69,7 +80,11 @@ function App() {
     setIsLoadingTrack,
   } = useAppStore();
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isMetadataEditorOpen, setIsMetadataEditorOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [metadataDraft, setMetadataDraft] = useState<MetadataDraft>(() => createMetadataDraft());
+  const [metadataStatus, setMetadataStatus] = useState<string | undefined>();
+  const [isSavingMetadata, setIsSavingMetadata] = useState(false);
   const preloadQueueRef = useRef<Set<string>>(new Set());
 
   const selectedSong = useMemo(
@@ -88,7 +103,7 @@ function App() {
 
   useEffect(() => {
     if (!isTauriRuntime) {
-      setScanError("Run `pnpm tauri dev` to use folder import and playback in the macOS desktop app.");
+      setScanError("Run `pnpm run desktop` to use folder import and playback in the macOS desktop app.");
       return;
     }
 
@@ -123,9 +138,20 @@ function App() {
     preloadSong(songs[0].id);
   }, [songs]);
 
+  useEffect(() => {
+    setMetadataDraft(createMetadataDraft(selectedSong));
+    setMetadataStatus(undefined);
+  }, [selectedSong?.id]);
+
+  useEffect(() => {
+    if (!activeVisualizerIds.includes(visualizerMode)) {
+      setVisualizerMode("classicBars");
+    }
+  }, [setVisualizerMode, visualizerMode]);
+
   async function chooseFolder() {
     if (!isTauriRuntime) {
-      setScanError("This screen is running in a browser. Start the desktop app with `pnpm tauri dev`.");
+      setScanError("This screen is running in a browser. Start the desktop app with `pnpm run desktop`.");
       return;
     }
 
@@ -152,9 +178,100 @@ function App() {
     }
   }
 
+  async function rescanFolder() {
+    if (!isTauriRuntime) {
+      setScanError("Directory rescans use the Tauri/Rust backend. Start the desktop app with `pnpm run desktop`.");
+      return;
+    }
+
+    setIsScanning(true);
+    setScanError(undefined);
+    try {
+      const nextSongs = await invoke<Song[]>("rescan_music_folder");
+      setSongs(nextSongs);
+      if (nextSongs.length > 0 && !nextSongs.some((song) => song.id === selectedSongId)) {
+        setSelectedSongId(nextSongs[0].id);
+      }
+    } catch (error) {
+      setScanError(String(error));
+    } finally {
+      setIsScanning(false);
+    }
+  }
+
+  function updateSongInState(updatedSong: Song) {
+    setSongs(songs.map((song) => (song.id === updatedSong.id ? updatedSong : song)));
+    if (playerStatus.songId === updatedSong.id) {
+      setPlayerStatus({
+        ...playerStatus,
+        title: updatedSong.title,
+        artist: updatedSong.artist,
+      });
+    }
+  }
+
+  async function chooseAlbumArt() {
+    if (!isTauriRuntime) {
+      setMetadataStatus("Album art import is available in the desktop app.");
+      return;
+    }
+
+    setMetadataStatus(undefined);
+    try {
+      const selected = await open({
+        multiple: false,
+        title: "Choose album art",
+        filters: [
+          {
+            name: "Images",
+            extensions: ["png", "jpg", "jpeg", "webp"],
+          },
+        ],
+      });
+      if (typeof selected !== "string") return;
+      const optimizedPath = await invoke<string>("import_album_art", { sourcePath: selected });
+      setMetadataDraft((draft) => ({ ...draft, coverArtPath: optimizedPath }));
+      setMetadataStatus("Artwork optimized to 1024 x 1024 JPEG.");
+    } catch (error) {
+      setMetadataStatus(String(error));
+    }
+  }
+
+  async function saveMetadata() {
+    if (!selectedSong) return;
+    if (!isTauriRuntime) {
+      setMetadataStatus("Metadata editing is available in the desktop app.");
+      return;
+    }
+
+    setIsSavingMetadata(true);
+    setMetadataStatus(undefined);
+    try {
+      const metadata: SongMetadataInput = {
+        title: textOrNull(metadataDraft.title),
+        artist: textOrNull(metadataDraft.artist),
+        genre: textOrNull(metadataDraft.genre),
+        year: numberOrNull(metadataDraft.year),
+        coverArtPath: metadataDraft.coverArtPath,
+      };
+      const updatedSong = await invoke<Song>("update_song_metadata", {
+        songId: selectedSong.id,
+        metadata,
+      });
+      updateSongInState(updatedSong);
+      setMetadataDraft(createMetadataDraft(updatedSong));
+      setMetadataStatus("Metadata saved locally.");
+      setIsMetadataEditorOpen(false);
+    } catch (error) {
+      setMetadataStatus(String(error));
+    } finally {
+      setIsSavingMetadata(false);
+    }
+  }
+
   async function play(song: Song | undefined = selectedSong) {
     if (!isTauriRuntime) {
-      setScanError("Playback uses the Tauri/Rust backend. Start the desktop app with `pnpm tauri dev`.");
+      setScanError("Playback uses the Tauri/Rust backend. Start the desktop app with `pnpm run desktop`.");
       return;
     }
     if (!song) return;
@@ -240,10 +357,12 @@ function App() {
         <header className="title-strip">
           <div className="brand-lockup">
             <Waves size={15} />
-            <span>LOCALAMP</span>
+            <span>LAPIS PLAYER</span>
           </div>
           <div className="title-marquee">
-            {playerStatus.title ?? selectedSong?.title ?? selectedSong?.fileName ?? "No song loaded"}
+            <MarqueeLine
+              text={playerStatus.title ?? selectedSong?.title ?? selectedSong?.fileName ?? "No song loaded"}
+            />
           </div>
           <button className="icon-button" type="button" onClick={() => setIsSettingsOpen(true)}>
             <Settings size={15} />
@@ -252,7 +371,14 @@ function App() {
 
         <div className="deck-grid">
           <aside className="left-rack">
-            <CoverPanel song={selectedSong} />
+            <CoverPanel
+              song={selectedSong}
+              onEdit={() => {
+                setMetadataDraft(createMetadataDraft(selectedSong));
+                setMetadataStatus(undefined);
+                setIsMetadataEditorOpen(true);
+              }}
+            />
             <TransportPanel
               canPlay={songs.length > 0}
               isLoadingTrack={isLoadingTrack}
@@ -292,6 +418,16 @@ function App() {
               <FolderOpen size={15} />
               {isScanning ? "Scanning..." : "Import Folder"}
             </button>
+            <button
+              className="icon-button refresh-button"
+              type="button"
+              title="Rescan music directory"
+              aria-label="Rescan music directory"
+              disabled={isScanning}
+              onClick={() => void rescanFolder()}
+            >
+              <RefreshCw size={14} className={clsx(isScanning && "spin-icon")} />
+            </button>
             <label className="search-box">
               <Search size={14} />
               <input
@@ -327,24 +463,147 @@ function App() {
           onClose={() => setIsSettingsOpen(false)}
         />
       )}
+
+      {isMetadataEditorOpen && (
+        <MetadataEditor
+          draft={metadataDraft}
+          song={selectedSong}
+          status={metadataStatus}
+          isSaving={isSavingMetadata}
+          onDraftChange={setMetadataDraft}
+          onChooseArt={() => void chooseAlbumArt()}
+          onSave={() => void saveMetadata()}
+          onClose={() => setIsMetadataEditorOpen(false)}
+        />
+      )}
     </main>
   );
 }
 
-function CoverPanel({ song }: { song?: Song }) {
+function CoverPanel({ song, onEdit }: { song?: Song; onEdit: () => void }) {
   const coverUrl = song?.coverArtPath ? convertFileSrc(song.coverArtPath) : undefined;
 
   return (
     <section className="cover-panel">
       <div className="cover-art">
-        {coverUrl ? <img src={coverUrl} alt="" /> : <div className="cover-placeholder">LOCAL</div>}
+        {coverUrl ? <img src={coverUrl} alt="" /> : <div className="cover-placeholder">LAPIS</div>}
       </div>
       <div className="song-readout">
-        <strong>{song?.title ?? song?.fileName ?? "No track selected"}</strong>
-        <span>{song?.artist ?? "Unknown Artist"}</span>
-        <span>{song?.album ?? "Unknown Album"}</span>
+        <MarqueeLine
+          className="song-title-line"
+          text={song?.title ?? song?.fileName ?? "No track selected"}
+        />
+        <MarqueeLine
+          className="song-meta-line"
+          text={song?.artist ?? "Unknown Artist"}
+        />
+        <MarqueeLine
+          className="song-meta-line"
+          text={`${song?.genre ?? "Unknown Genre"}${song?.year ? ` / ${song.year}` : ""}`}
+        />
+        <button className="utility-button edit-metadata-button" type="button" disabled={!song} onClick={onEdit}>
+          <PencilLine size={14} />
+          Edit Metadata
+        </button>
       </div>
     </section>
+  );
+}
+
+function MarqueeLine({ text, className }: { text: string; className?: string }) {
+  const shouldScroll = text.length > 24;
+
+  if (!shouldScroll) {
+    return (
+      <span className={clsx("marquee-line marquee-static", className)} title={text}>
+        {text}
+      </span>
+    );
+  }
+
+  return (
+    <span className={clsx("marquee-line", className)} title={text}>
+      <span className="marquee-track">
+        <span>{text}</span>
+        <span aria-hidden="true">{text}</span>
+      </span>
+    </span>
+  );
+}
+
+function MetadataEditor({
+  draft,
+  song,
+  status,
+  isSaving,
+  onDraftChange,
+  onChooseArt,
+  onSave,
+  onClose,
+}: {
+  draft: MetadataDraft;
+  song?: Song;
+  status?: string;
+  isSaving: boolean;
+  onDraftChange: (draft: MetadataDraft) => void;
+  onChooseArt: () => void;
+  onSave: () => void;
+  onClose: () => void;
+}) {
+  const coverUrl = draft.coverArtPath ? convertFileSrc(draft.coverArtPath) : undefined;
+
+  function patchDraft(patch: Partial<MetadataDraft>) {
+    onDraftChange({ ...draft, ...patch });
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <section className="metadata-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <div className="metadata-heading">
+            <PencilLine size={14} />
+            <strong>Edit Track</strong>
+          </div>
+          <button className="icon-button" type="button" aria-label="Close metadata editor" onClick={onClose}>
+            <X size={15} />
+          </button>
+        </header>
+        <div className="metadata-modal-body">
+          <div className="metadata-art-preview">
+            {coverUrl ? <img src={coverUrl} alt="" /> : <span>1024</span>}
+          </div>
+          <div className="metadata-grid">
+            <label>
+              <span>Title</span>
+              <input value={draft.title} disabled={!song} onChange={(event) => patchDraft({ title: event.currentTarget.value })} />
+            </label>
+            <label>
+              <span>Artist</span>
+              <input value={draft.artist} disabled={!song} onChange={(event) => patchDraft({ artist: event.currentTarget.value })} />
+            </label>
+            <label>
+              <span>Genre</span>
+              <input value={draft.genre} disabled={!song} onChange={(event) => patchDraft({ genre: event.currentTarget.value })} />
+            </label>
+            <label>
+              <span>Year</span>
+              <input value={draft.year} inputMode="numeric" disabled={!song} onChange={(event) => patchDraft({ year: event.currentTarget.value })} />
+            </label>
+          </div>
+        </div>
+        <footer>
+          <button className="utility-button" type="button" disabled={!song} onClick={onChooseArt}>
+            <ImagePlus size={14} />
+            Album Art
+          </button>
+          <button className="utility-button save-button" type="button" disabled={!song || isSaving} onClick={onSave}>
+            <Save size={14} />
+            {isSaving ? "Saving..." : "Save"}
+          </button>
+        </footer>
+        {status && <div className="metadata-status">{status}</div>}
+      </section>
+    </div>
   );
 }
 
@@ -359,8 +618,8 @@ function SideMeter({
   const vocal = frame?.mids ?? 0;
   const treble = frame?.treble ?? 0;
   const bassPulse = frame?.bassPulse ?? 0;
-  const signal = Math.min(1, level * 0.36 + vocal * 0.48 + bassPulse * 0.14 + treble * 0.1);
-  const vocalFocus = Math.min(1, vocal * 1.18 + treble * 0.16);
+  const signal = Math.min(1, (level * 0.36 + vocal * 0.48 + bassPulse * 0.14 + treble * 0.1) * 1.5);
+  const vocalFocus = Math.min(1, (vocal * 1.18 + treble * 0.16) * 1.5);
 
   return (
     <div className={clsx("side-meter", `side-meter-${side}`)} aria-hidden="true">
@@ -1409,169 +1668,109 @@ function drawWaveform(
   height: number,
   frame: VisualizerFrame,
   renderState: VisualizerRenderState,
-  palette: ReturnType<typeof getPalette>,
-  phase: number,
+  _palette: ReturnType<typeof getPalette>,
+  _phase: number,
 ) {
-  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.7);
-  const vocalBands = selectCenterOutBands(frame.vocalBins?.length ? frame.vocalBins : frame.frequencyBins, 96);
-  const melodyBands = selectCenterOutBands(trimVisualizerBins(frame.frequencyBins), 96);
-  const vocalEnergy = averageBands(vocalBands);
-  const melodyEnergy = averageBands(melodyBands.slice(Math.floor(melodyBands.length * 0.28)));
-  const vocalPresence = Math.min(1, Math.max(0, frame.mids * 0.82 + vocalEnergy * 0.72 - frame.treble * 0.18));
-  const melodyPresence = Math.min(1, Math.max(0, melodyEnergy * 0.82 + frame.treble * 0.42 - vocalPresence * 0.28));
-  const vocalBlend = vocalPresence / Math.max(0.001, vocalPresence + melodyPresence);
-  const melodyBlend = 1 - vocalBlend;
-  const songFlow = Math.min(1, frame.mids * 0.36 + frame.treble * 0.24 + vocalEnergy * 0.28 + melodyEnergy * 0.28);
-  renderState.vocalWave.length = Math.max(renderState.vocalWave.length, vocalBands.length);
-  renderState.melodyWave.length = Math.max(renderState.melodyWave.length, melodyBands.length);
+  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.25);
+  const bins = selectCenterOutBands(frame.frequencyBins, 96);
+  const songFlow = Math.min(1, frame.bass * 0.32 + frame.mids * 0.34 + frame.treble * 0.28 + bassAccent * 0.22);
   const centerY = height / 2;
+  const centerX = width / 2;
 
-  const field = context.createLinearGradient(0, centerY - height * 0.32, 0, centerY + height * 0.32);
-  field.addColorStop(0, "rgba(0,0,0,0)");
-  field.addColorStop(0.38, alphaColor(palette.iidxCyan, 0.035 + vocalPresence * 0.08));
-  field.addColorStop(0.5, alphaColor(palette.peak, 0.035 + bassAccent * 0.04));
-  field.addColorStop(0.62, alphaColor(palette.iidxViolet, 0.035 + melodyPresence * 0.07));
-  field.addColorStop(1, "rgba(0,0,0,0)");
-  context.fillStyle = field;
+  const sky = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, Math.max(width, height) * 0.75);
+  sky.addColorStop(0, "#10222b");
+  sky.addColorStop(0.44, "#071122");
+  sky.addColorStop(1, "#02040b");
+  context.fillStyle = sky;
   context.fillRect(0, 0, width, height);
 
-  context.strokeStyle = alphaColor(palette.gridStrong, 0.3);
-  context.lineWidth = 1;
-  context.beginPath();
-  context.moveTo(0, centerY);
-  context.lineTo(width, centerY);
-  context.stroke();
-
-  context.strokeStyle = alphaColor(palette.gridStrong, 0.12 + songFlow * 0.05);
-  for (let band = -2; band <= 2; band += 1) {
-    if (band === 0) continue;
-    const y = centerY + band * height * 0.105;
+  context.globalCompositeOperation = "screen";
+  const starCount = 120;
+  for (let index = 0; index < starCount; index += 1) {
+    const seed = index * 37.719;
+    const x = fract(Math.sin(seed) * 43758.5453) * width;
+    const y = fract(Math.sin(seed + 9.13) * 24634.6345) * height;
+    const depth = fract(Math.sin(seed + 4.91) * 9812.331);
+    const starSize = 0.5 + depth * 1.05 + songFlow * 0.22;
+    const streak = depth > 0.78 ? 2.5 + depth * 4.2 + bassAccent * 1.4 : starSize;
+    context.globalAlpha = 0.14 + depth * 0.42;
+    context.fillStyle = depth > 0.82 ? "#fff0cf" : "#7fffe5";
     context.beginPath();
-    context.moveTo(width * 0.08, y);
-    context.lineTo(width * 0.92, y);
-    context.stroke();
+    context.ellipse(x, y, streak, starSize * 0.48, -0.25, 0, Math.PI * 2);
+    context.fill();
   }
 
-  const scopePoints = 164;
-  renderState.scopeWave.length = Math.max(renderState.scopeWave.length, scopePoints + 1);
-  const scopeValues = Array.from({ length: scopePoints + 1 }, (_, point) => {
-    const t = point / scopePoints;
-    const sampleIndex = Math.round(t * Math.max(0, frame.waveform.length - 1));
-    const raw = smoothedWaveSample(frame.waveform, sampleIndex, 9);
-    const vocalIndex = Math.min(vocalBands.length - 1, Math.floor(t * vocalBands.length));
-    const melodyIndex = Math.min(melodyBands.length - 1, Math.floor(t * melodyBands.length));
-    const vocalTarget = vocalBands[vocalIndex] ?? 0;
-    const melodyTarget = melodyBands[melodyIndex] ?? 0;
-    const vocalCurrent = renderState.vocalWave[vocalIndex] ?? 0;
-    const melodyCurrent = renderState.melodyWave[melodyIndex] ?? 0;
-    const vocal = vocalCurrent + (vocalTarget - vocalCurrent) * (vocalTarget > vocalCurrent ? 0.085 : 0.032);
-    const melody = melodyCurrent + (melodyTarget - melodyCurrent) * (melodyTarget > melodyCurrent ? 0.12 : 0.045);
-    renderState.vocalWave[vocalIndex] = vocal;
-    renderState.melodyWave[melodyIndex] = melody;
-
-    const phrase = Math.sin(phase * 0.82 + t * Math.PI * (2.4 + vocalBlend * 1.5)) * vocal * vocalBlend;
-    const harmonic =
-      (Math.sin(phase * 0.56 + t * Math.PI * 4.8) * 0.72 +
-        Math.sin(phase * 0.34 + t * Math.PI * 7.2 + 1.2) * 0.28) *
-      melody *
-      melodyBlend;
-    const breath = Math.sin(phase * 0.38 + t * Math.PI * 1.2) * (vocal * vocalBlend + melody * melodyBlend) * 0.28;
-    const beatSway = Math.sin(phase * 1.16 + t * Math.PI * 1.5) * bassAccent * 0.16;
-    const rawTexture = Math.tanh(raw * 1.55) * (0.035 + frame.treble * 0.045 + songFlow * 0.018);
-    const target = phrase * 0.52 + harmonic * 0.42 + breath + beatSway + rawTexture;
-    const current = renderState.scopeWave[point] ?? 0;
-    const scoped = current + (target - current) * (Math.abs(target) > Math.abs(current) ? 0.18 : 0.065);
-    renderState.scopeWave[point] = scoped;
-    return scoped;
-  });
-
-  const upper = scopeValues.map((value) => centerY + value * height * (0.25 + songFlow * 0.04));
-  const lower = scopeValues.map((value) => centerY - value * height * (0.14 + vocalBlend * 0.06));
-
-  context.globalCompositeOperation = "lighter";
-  const wash = context.createLinearGradient(0, centerY - height * 0.22, width, centerY + height * 0.22);
-  wash.addColorStop(0, alphaColor(palette.iidxCyan, 0.04 + vocalPresence * 0.06));
-  wash.addColorStop(0.5, alphaColor(palette.peak, 0.035 + bassAccent * 0.045));
-  wash.addColorStop(1, alphaColor(palette.iidxViolet, 0.035 + melodyPresence * 0.055));
-  context.fillStyle = wash;
-  context.beginPath();
-  upper.forEach((y, index) => {
-    const x = (index / scopePoints) * width;
-    if (index === 0) context.moveTo(x, y);
-    else context.lineTo(x, y);
-  });
-  for (let index = lower.length - 1; index >= 0; index -= 1) {
-    const x = (index / scopePoints) * width;
-    context.lineTo(x, lower[index]);
-  }
-  context.closePath();
-  context.fill();
-
-  context.globalCompositeOperation = "lighter";
-  context.strokeStyle = vocalBlend > 0.54 ? palette.iidxCyan : palette.iidxViolet;
-  context.lineWidth = 1.7 + songFlow * 1.1;
-  context.shadowColor = context.strokeStyle;
-  context.shadowBlur = 9 + songFlow * 12 + bassAccent * 4;
-  context.beginPath();
-  scopeValues.forEach((_, index) => {
-    const x = (index / scopePoints) * width;
-    const y = upper[index];
-    if (index === 0) {
-      context.moveTo(x, y);
-      return;
-    }
-    const previousX = ((index - 1) / scopePoints) * width;
-    const previousY = upper[index - 1];
-    context.quadraticCurveTo(previousX, previousY, (previousX + x) / 2, (previousY + y) / 2);
-  });
-  context.stroke();
-
-  context.strokeStyle = alphaColor(palette.hot, 0.44 + bassAccent * 0.14);
-  context.lineWidth = 1.1 + melodyPresence * 0.7;
-  context.globalAlpha = 0.48 + songFlow * 0.16;
-  context.shadowColor = palette.hot;
-  context.shadowBlur = 7 + melodyPresence * 9;
-  context.beginPath();
-  scopeValues.forEach((_, index) => {
-    const x = (index / scopePoints) * width;
-    const y = lower[index];
-    if (index === 0) {
-      context.moveTo(x, y);
-      return;
-    }
-    const previousX = ((index - 1) / scopePoints) * width;
-    const previousY = lower[index - 1];
-    context.quadraticCurveTo(previousX, previousY, (previousX + x) / 2, (previousY + y) / 2);
-  });
-  context.stroke();
-
-  context.strokeStyle = alphaColor(palette.peak, 0.1 + bassAccent * 0.18);
-  context.lineWidth = 1;
-  for (let marker = 0; marker < 5; marker += 1) {
-    const x = ((marker / 4 + phase * 0.028) % 1) * width;
-    const heightBoost = height * (0.045 + bassAccent * 0.07);
-    context.beginPath();
-    context.moveTo(x, centerY - heightBoost);
-    context.lineTo(x, centerY + heightBoost);
-    context.stroke();
-  }
-
-  context.globalCompositeOperation = "source-over";
-  context.shadowBlur = 0;
-  context.globalAlpha = 0.58;
-  context.fillStyle = alphaColor(vocalBlend > 0.54 ? palette.iidxCyan : palette.iidxViolet, 0.76);
-  context.font = "10px 'IBM Plex Mono', 'Courier New', monospace";
-  context.fillText(vocalBlend > 0.54 ? "VOCAL TRACE" : "MELODY TRACE", width * 0.06, height - 18);
-  context.fillStyle = alphaColor(palette.gridStrong, 0.42);
-  context.fillRect(width * 0.22, height - 22, width * 0.22, 3);
-  context.fillStyle = alphaColor(palette.iidxCyan, 0.78);
-  context.fillRect(width * 0.22, height - 22, width * 0.22 * vocalBlend, 3);
-  context.fillStyle = alphaColor(palette.iidxViolet, 0.76);
-  context.fillRect(width * 0.22 + width * 0.22 * vocalBlend, height - 22, width * 0.22 * melodyBlend, 3);
-
+  const nebula = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, Math.min(width, height) * 0.52);
+  nebula.addColorStop(0, alphaColor("#00ffc8", 0.08 + songFlow * 0.07));
+  nebula.addColorStop(0.48, alphaColor("#ff3fb7", 0.035 + bassAccent * 0.045));
+  nebula.addColorStop(1, "rgba(0,0,0,0)");
   context.globalAlpha = 1;
-  context.shadowBlur = 0;
+  context.fillStyle = nebula;
+  context.fillRect(0, 0, width, height);
   context.globalCompositeOperation = "source-over";
+
+  const barCount = 74;
+  renderState.scopeWave.length = Math.max(renderState.scopeWave.length, barCount);
+  const contentWidth = width * 0.76;
+  const startX = (width - contentWidth) / 2;
+  const barGap = Math.max(4, contentWidth / barCount * 0.42);
+  const barWidth = Math.max(3, (contentWidth - barGap * (barCount - 1)) / barCount);
+  const maxBarHeight = height * 0.24;
+
+  context.shadowBlur = 10 + songFlow * 8;
+  for (let index = 0; index < barCount; index += 1) {
+    const t = index / Math.max(1, barCount - 1);
+    const sampleIndex = Math.round(t * Math.max(0, frame.waveform.length - 1));
+    const raw = Math.abs(smoothedWaveSample(frame.waveform, sampleIndex, 1));
+    const previousRaw = Math.abs(smoothedWaveSample(frame.waveform, Math.max(0, sampleIndex - 3), 1));
+    const nextRaw = Math.abs(smoothedWaveSample(frame.waveform, Math.min(frame.waveform.length - 1, sampleIndex + 3), 1));
+    const transient = Math.min(1, Math.abs(nextRaw - previousRaw) * 2.6);
+    const band = bins[Math.min(bins.length - 1, Math.floor(t * bins.length))] ?? 0;
+    const edgeShape = Math.pow(Math.abs(t - 0.5) * 2, 1.15);
+    const sideLift = t < 0.18 ? (0.18 - t) * 2.2 * (frame.bass + bassAccent) : t > 0.68 ? (t - 0.68) * 1.25 * (frame.mids + frame.treble) : 0;
+    const target = Math.min(1, raw * 2.2 + band * 0.38 + transient * 0.34 + sideLift * 0.12 + edgeShape * 0.035);
+    const current = renderState.scopeWave[index] ?? 0;
+    const value = current + (target - current) * (target > current ? 0.56 : 0.18);
+    renderState.scopeWave[index] = value;
+
+    const x = startX + index * (barWidth + barGap);
+    const barHeight = Math.max(3, value * maxBarHeight);
+    const hue = lerpColor("#19ffd5", "#ff3fb7", t);
+    const glow = t < 0.5 ? "#00ffd0" : "#ff4abf";
+    const capGlow = alphaColor("#fff3c4", 0.24 + value * 0.34);
+
+    context.shadowColor = glow;
+    context.fillStyle = hue;
+    context.beginPath();
+    context.roundRect(x, centerY - barHeight, barWidth, barHeight * 2, Math.min(barWidth / 2, 5));
+    context.fill();
+
+    context.globalAlpha = 0.6 + value * 0.35;
+    context.fillStyle = capGlow;
+    context.fillRect(x + barWidth * 0.12, centerY - barHeight, barWidth * 0.76, Math.min(3, barHeight));
+    context.fillRect(x + barWidth * 0.12, centerY + barHeight - Math.min(3, barHeight), barWidth * 0.76, Math.min(3, barHeight));
+    context.globalAlpha = 1;
+  }
+  context.shadowBlur = 0;
+
+  const pulse = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, width * 0.42);
+  pulse.addColorStop(0, alphaColor("#00ffd0", 0.04 + bassAccent * 0.035));
+  pulse.addColorStop(0.45, alphaColor("#ff3fb7", 0.018 + songFlow * 0.035));
+  pulse.addColorStop(1, "rgba(0,0,0,0)");
+  context.globalCompositeOperation = "screen";
+  context.fillStyle = pulse;
+  context.fillRect(0, 0, width, height);
+  context.globalCompositeOperation = "source-over";
+
+  context.strokeStyle = alphaColor("#fff0a8", 0.07 + songFlow * 0.07);
+  context.lineWidth = 1;
+  for (let band = -1; band <= 1; band += 2) {
+    const y = centerY + band * height * 0.008;
+    context.beginPath();
+    context.moveTo(startX, y);
+    context.lineTo(startX + contentWidth, y);
+    context.stroke();
+  }
 }
 
 function drawCenterStereo(
@@ -1747,11 +1946,6 @@ function selectMirroredCenterBands(source: number[], bandCount: number) {
   });
 }
 
-function averageBands(source: number[]) {
-  if (source.length === 0) return 0;
-  return source.reduce((sum, value) => sum + value, 0) / source.length;
-}
-
 function getBarColor(
   palette: ReturnType<typeof getPalette>,
   mode: VisualizerMode,
@@ -1783,6 +1977,21 @@ function alphaColor(hex: string, alpha: number) {
 
 function lerp(from: number, to: number, amount: number) {
   return from + (to - from) * amount;
+}
+
+function lerpColor(fromHex: string, toHex: string, amount: number) {
+  const amountBounded = Math.min(1, Math.max(0, amount));
+  const fromRed = Number.parseInt(fromHex.slice(1, 3), 16);
+  const fromGreen = Number.parseInt(fromHex.slice(3, 5), 16);
+  const fromBlue = Number.parseInt(fromHex.slice(5, 7), 16);
+  const toRed = Number.parseInt(toHex.slice(1, 3), 16);
+  const toGreen = Number.parseInt(toHex.slice(3, 5), 16);
+  const toBlue = Number.parseInt(toHex.slice(5, 7), 16);
+  const red = Math.round(lerp(fromRed, toRed, amountBounded));
+  const green = Math.round(lerp(fromGreen, toGreen, amountBounded));
+  const blue = Math.round(lerp(fromBlue, toBlue, amountBounded));
+
+  return `rgb(${red}, ${green}, ${blue})`;
 }
 
 function fract(value: number) {
@@ -1909,7 +2118,48 @@ function SettingsModal({
   );
 }
 
+function createMetadataDraft(song?: Song): MetadataDraft {
+  return {
+    title: song?.title ?? "",
+    artist: song?.artist ?? "",
+    genre: song?.genre ?? "",
+    year: song?.year ? String(song.year) : "",
+    coverArtPath: song?.coverArtPath ?? null,
+  };
+}
+
+function textOrNull(value: string) {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function numberOrNull(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function getPalette(theme: AppTheme) {
+  if (theme === "lapis") {
+    return {
+      panel: "#06111d",
+      grid: "rgba(76, 177, 255, 0.12)",
+      muted: "#80b4d8",
+      low: "#2779d8",
+      mid: "#66d6ff",
+      hot: "#c7f3ff",
+      peak: "#fff4c2",
+      gridStrong: "rgba(138, 202, 245, 0.22)",
+      windowsLow: "#2ec7ff",
+      windowsMid: "#d9f4ff",
+      windowsHot: "#ffb84a",
+      iidxViolet: "#3a5fff",
+      iidxCyan: "#64e7ff",
+      iidxBlue: "#1f75ff",
+      iidxHot: "#fff8de",
+    };
+  }
   if (theme === "amber") {
     return {
       panel: "#120d06",
