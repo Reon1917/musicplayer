@@ -2,11 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Condvar, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    Arc, Condvar, Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -14,13 +14,14 @@ use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 use serde::Serialize;
 use symphonia::core::audio::GenericAudioBufferRef;
-use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::TrackType;
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::{Time, TimeBase};
 use tauri::{AppHandle, Emitter};
 
 use crate::db::Song;
@@ -35,99 +36,12 @@ const BASS_LOW_HZ: f32 = 20.0;
 const BASS_HIGH_HZ: f32 = 150.0;
 const VOCAL_LOW_HZ: f32 = 250.0;
 const VOCAL_HIGH_HZ: f32 = 4_000.0;
-const DECODE_CACHE_LIMIT: usize = 3;
 
-#[derive(Clone)]
-struct TrackAudio {
-    song_id: String,
-    title: String,
-    artist: Option<String>,
-    samples: Arc<Vec<f32>>,
-    sample_rate: u32,
-    duration_seconds: f64,
-}
-
-#[derive(Clone)]
-struct DecodedTrack {
-    samples: Arc<Vec<f32>>,
-    sample_rate: u32,
-    duration_seconds: f64,
-}
-
-struct DecodedTrackCache {
-    tracks: HashMap<String, DecodedTrack>,
-    order: VecDeque<String>,
-    in_flight: HashMap<String, Arc<DecodeSlot>>,
-}
-
-struct DecodeSlot {
-    result: Mutex<Option<Result<DecodedTrack, String>>>,
-    ready: Condvar,
-}
-
-impl DecodeSlot {
-    fn new() -> Self {
-        Self {
-            result: Mutex::new(None),
-            ready: Condvar::new(),
-        }
-    }
-
-    fn wait(&self) -> Result<DecodedTrack, String> {
-        let mut result = self.result.lock().map_err(|err| err.to_string())?;
-        loop {
-            if let Some(result) = result.clone() {
-                return result;
-            }
-            result = self.ready.wait(result).map_err(|err| err.to_string())?;
-        }
-    }
-}
-
-impl DecodedTrackCache {
-    fn new() -> Self {
-        Self {
-            tracks: HashMap::new(),
-            order: VecDeque::new(),
-            in_flight: HashMap::new(),
-        }
-    }
-
-    fn get(&mut self, key: &str) -> Option<DecodedTrack> {
-        let decoded = self.tracks.get(key).cloned()?;
-        self.touch(key);
-        Some(decoded)
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.tracks.contains_key(key)
-    }
-
-    fn in_flight(&self, key: &str) -> bool {
-        self.in_flight.contains_key(key)
-    }
-
-    fn insert_in_flight(&mut self, key: String, slot: Arc<DecodeSlot>) {
-        self.in_flight.insert(key, slot);
-    }
-
-    fn insert(&mut self, key: String, decoded: DecodedTrack) {
-        self.tracks.insert(key.clone(), decoded);
-        self.touch(&key);
-        while self.order.len() > DECODE_CACHE_LIMIT {
-            if let Some(oldest) = self.order.pop_front() {
-                self.tracks.remove(&oldest);
-            }
-        }
-    }
-
-    fn touch(&mut self, key: &str) {
-        if let Some(index) = self.order.iter().position(|stored| stored == key) {
-            self.order.remove(index);
-        }
-        self.order.push_back(key.to_string());
-    }
-}
+const STREAM_BUFFER_SECONDS: f32 = 3.0;
+const START_BUFFER_SECONDS: f32 = 0.35;
+const PRELOAD_SECONDS: f32 = 2.0;
+const WARM_CACHE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+const MEDIA_BUFFER_LEN: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -158,55 +72,253 @@ pub struct VisualizerFrame {
     pub peaks: Vec<f32>,
 }
 
+struct PlaybackCore {
+    song_id: String,
+    title: String,
+    artist: Option<String>,
+    file_path: String,
+    duration_seconds: f64,
+    sample_rate: u32,
+    ring: Mutex<VecDeque<f32>>,
+    space_available: Condvar,
+    capacity_samples: usize,
+    rolling: Mutex<VecDeque<f32>>,
+    rolling_capacity_samples: usize,
+    finished: AtomicBool,
+    stop_requested: AtomicBool,
+}
+
+impl PlaybackCore {
+    fn new(song: Song, sample_rate: u32) -> Self {
+        let capacity_samples =
+            ((sample_rate as f32 * STREAM_BUFFER_SECONDS) as usize).max(FFT_SIZE) * 2;
+        Self {
+            song_id: song.id,
+            title: song.title.unwrap_or(song.file_name),
+            artist: song.artist,
+            file_path: song.file_path,
+            duration_seconds: song.duration_seconds.unwrap_or(0.0),
+            sample_rate,
+            ring: Mutex::new(VecDeque::with_capacity(capacity_samples)),
+            space_available: Condvar::new(),
+            capacity_samples,
+            rolling: Mutex::new(VecDeque::with_capacity(FFT_SIZE * 2)),
+            rolling_capacity_samples: FFT_SIZE * 2,
+            finished: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+        }
+    }
+
+    fn buffered_frames(&self) -> usize {
+        self.ring.lock().map(|ring| ring.len() / 2).unwrap_or(0)
+    }
+
+    fn push_samples_blocking(&self, samples: &[f32]) {
+        let mut offset = 0;
+        while offset < samples.len() && !self.stop_requested.load(Ordering::Relaxed) {
+            let mut ring = match self.ring.lock() {
+                Ok(ring) => ring,
+                Err(_) => return,
+            };
+
+            while ring.len() >= self.capacity_samples
+                && !self.stop_requested.load(Ordering::Relaxed)
+            {
+                ring = match self.space_available.wait(ring) {
+                    Ok(ring) => ring,
+                    Err(_) => return,
+                };
+            }
+
+            if self.stop_requested.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let available = self.capacity_samples.saturating_sub(ring.len());
+            let count = available.min(samples.len() - offset);
+            ring.extend(samples[offset..offset + count].iter().copied());
+            offset += count;
+        }
+    }
+
+    fn seed_samples(&self, samples: &[f32]) {
+        if let Ok(mut ring) = self.ring.lock() {
+            let count = samples.len().min(self.capacity_samples);
+            ring.extend(samples[..count].iter().copied());
+        }
+    }
+
+    fn wait_until_primed(&self, min_frames: usize, timeout: Duration) {
+        let start = Instant::now();
+        while !self.finished.load(Ordering::Relaxed)
+            && !self.stop_requested.load(Ordering::Relaxed)
+            && self.buffered_frames() < min_frames
+            && start.elapsed() < timeout
+        {
+            thread::sleep(Duration::from_millis(8));
+        }
+    }
+
+    fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        self.space_available.notify_all();
+    }
+
+    fn append_rolling(&self, left: f32, right: f32) {
+        if let Ok(mut rolling) = self.rolling.lock() {
+            rolling.push_back(left);
+            rolling.push_back(right);
+            while rolling.len() > self.rolling_capacity_samples {
+                rolling.pop_front();
+            }
+        }
+    }
+
+    fn rolling_samples(&self) -> Vec<f32> {
+        self.rolling
+            .lock()
+            .map(|rolling| rolling.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone)]
+struct WarmTrack {
+    song_id: String,
+    output_rate: u32,
+    samples: Arc<Vec<f32>>,
+}
+
+struct WarmTrackCache {
+    tracks: HashMap<String, WarmTrack>,
+    order: VecDeque<String>,
+    bytes: usize,
+    in_flight: HashMap<String, Arc<AtomicBool>>,
+}
+
+impl WarmTrackCache {
+    fn new() -> Self {
+        Self {
+            tracks: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            in_flight: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<WarmTrack> {
+        let warm = self.tracks.get(key).cloned()?;
+        self.touch(key);
+        Some(warm)
+    }
+
+    fn insert_in_flight(&mut self, key: String, cancel: Arc<AtomicBool>) -> bool {
+        if self.tracks.contains_key(&key) || self.in_flight.contains_key(&key) {
+            return false;
+        }
+        self.in_flight.insert(key, cancel);
+        true
+    }
+
+    fn insert(&mut self, key: String, warm: WarmTrack) {
+        if let Some(existing) = self.tracks.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(existing.samples.len() * 4);
+        }
+        self.bytes += warm.samples.len() * 4;
+        self.tracks.insert(key.clone(), warm);
+        self.touch(&key);
+        self.trim();
+    }
+
+    fn remove_in_flight(&mut self, key: &str) {
+        self.in_flight.remove(key);
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(index) = self.order.iter().position(|stored| stored == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.to_string());
+    }
+
+    fn trim(&mut self) {
+        while self.bytes > WARM_CACHE_BYTE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.tracks.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.samples.len() * 4);
+            }
+        }
+    }
+}
+
 pub struct Player {
-    current: Arc<RwLock<Option<TrackAudio>>>,
+    current: Arc<Mutex<Option<Arc<PlaybackCore>>>>,
     cursor_frame: Arc<AtomicUsize>,
     playing: Arc<AtomicBool>,
-    volume: Arc<RwLock<f32>>,
+    volume_bits: Arc<AtomicU32>,
     stream: Mutex<Option<Stream>>,
     output_sample_rate: Mutex<Option<u32>>,
     last_frame: Arc<Mutex<Option<VisualizerFrame>>>,
     visualizer_epoch: Arc<AtomicUsize>,
     play_request_epoch: Arc<AtomicUsize>,
-    decode_cache: Arc<Mutex<DecodedTrackCache>>,
+    warm_cache: Arc<Mutex<WarmTrackCache>>,
 }
 
 impl Player {
     pub fn new() -> Self {
         Self {
-            current: Arc::new(RwLock::new(None)),
+            current: Arc::new(Mutex::new(None)),
             cursor_frame: Arc::new(AtomicUsize::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(RwLock::new(0.8)),
+            volume_bits: Arc::new(AtomicU32::new(0.8f32.to_bits())),
             stream: Mutex::new(None),
             output_sample_rate: Mutex::new(None),
             last_frame: Arc::new(Mutex::new(None)),
             visualizer_epoch: Arc::new(AtomicUsize::new(0)),
             play_request_epoch: Arc::new(AtomicUsize::new(0)),
-            decode_cache: Arc::new(Mutex::new(DecodedTrackCache::new())),
+            warm_cache: Arc::new(Mutex::new(WarmTrackCache::new())),
         }
     }
 
     pub fn play_song(&self, song: Song, app: AppHandle) -> Result<PlayerStatus, String> {
+        validate_playable_file(&song)?;
         self.ensure_stream()?;
         let output_rate = self.output_sample_rate()?;
-        let cache_key = decoded_cache_key(&song.id, output_rate);
+        let cache_key = warm_cache_key(&song.id, output_rate);
         let request_epoch = self.play_request_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        self.playing.store(false, Ordering::Relaxed);
-        let decoded = self.get_or_decode_song(&song, output_rate, &cache_key)?;
+        self.stop_current(true);
+
+        let warm = self
+            .warm_cache
+            .lock()
+            .map_err(|err| err.to_string())?
+            .get(&cache_key);
+        let warm_frames = warm
+            .as_ref()
+            .filter(|warm| warm.song_id == song.id && warm.output_rate == output_rate)
+            .map(|warm| warm.samples.len() / 2)
+            .unwrap_or(0);
+
+        let core = Arc::new(PlaybackCore::new(song, output_rate));
+        if let Some(warm) = warm {
+            core.seed_samples(&warm.samples);
+        }
+
+        spawn_decode_worker(
+            Arc::clone(&core),
+            DecodeStart::AfterOutputFrames(warm_frames),
+        );
+        let min_frames = (output_rate as f32 * START_BUFFER_SECONDS) as usize;
+        core.wait_until_primed(min_frames, Duration::from_millis(900));
+
         if self.play_request_epoch.load(Ordering::Relaxed) != request_epoch {
+            core.request_stop();
             return Ok(self.status());
         }
-        let track = TrackAudio {
-            song_id: song.id.clone(),
-            title: song.title.clone().unwrap_or(song.file_name.clone()),
-            artist: song.artist.clone(),
-            duration_seconds: decoded.duration_seconds,
-            sample_rate: decoded.sample_rate,
-            samples: decoded.samples,
-        };
 
-        *self.current.write().map_err(|err| err.to_string())? = Some(track);
+        *self.current.lock().map_err(|err| err.to_string())? = Some(core);
         self.cursor_frame.store(0, Ordering::Relaxed);
         self.playing.store(true, Ordering::Relaxed);
         let epoch = self.visualizer_epoch.fetch_add(1, Ordering::Relaxed) + 1;
@@ -215,39 +327,34 @@ impl Player {
     }
 
     pub fn preload_song(&self, song: Song) -> Result<(), String> {
+        validate_playable_file(&song)?;
         self.ensure_stream()?;
         let output_rate = self.output_sample_rate()?;
-        let cache_key = decoded_cache_key(&song.id, output_rate);
-
-        if self
-            .decode_cache
-            .lock()
-            .map_err(|err| err.to_string())?
-            .contains(&cache_key)
+        let cache_key = warm_cache_key(&song.id, output_rate);
+        let cancel = Arc::new(AtomicBool::new(false));
         {
-            return Ok(());
-        }
-
-        let slot = Arc::new(DecodeSlot::new());
-        {
-            let mut cache = self.decode_cache.lock().map_err(|err| err.to_string())?;
-            if cache.contains(&cache_key) || cache.in_flight(&cache_key) {
+            let mut cache = self.warm_cache.lock().map_err(|err| err.to_string())?;
+            if !cache.insert_in_flight(cache_key.clone(), Arc::clone(&cancel)) {
                 return Ok(());
             }
-            cache.insert_in_flight(cache_key.clone(), Arc::clone(&slot));
         }
 
-        let decode_cache = Arc::clone(&self.decode_cache);
+        let warm_cache = Arc::clone(&self.warm_cache);
         thread::spawn(move || {
-            let decoded =
-                decode_audio_file(Path::new(&song.file_path), output_rate).map(|decoded| {
-                    DecodedTrack {
-                        samples: Arc::new(decoded.samples),
-                        sample_rate: decoded.sample_rate,
-                        duration_seconds: decoded.duration_seconds,
-                    }
-                });
-            finish_decode(&decode_cache, &cache_key, &slot, decoded);
+            let decoded = decode_warm_start(&song, output_rate, PRELOAD_SECONDS, &cancel);
+            if let Ok(mut cache) = warm_cache.lock() {
+                cache.remove_in_flight(&cache_key);
+                if let Ok(samples) = decoded {
+                    cache.insert(
+                        cache_key,
+                        WarmTrack {
+                            song_id: song.id,
+                            output_rate,
+                            samples: Arc::new(samples),
+                        },
+                    );
+                }
+            }
         });
 
         Ok(())
@@ -261,7 +368,7 @@ impl Player {
     pub fn resume(&self) -> Result<PlayerStatus, String> {
         if self
             .current
-            .read()
+            .lock()
             .map_err(|err| err.to_string())?
             .is_some()
         {
@@ -271,36 +378,84 @@ impl Player {
     }
 
     pub fn stop(&self) -> Result<PlayerStatus, String> {
-        self.playing.store(false, Ordering::Relaxed);
+        self.stop_current(true);
         self.cursor_frame.store(0, Ordering::Relaxed);
         Ok(self.status())
     }
 
     pub fn seek(&self, position_seconds: f64) -> Result<PlayerStatus, String> {
-        if let Some(track) = self.current.read().map_err(|err| err.to_string())?.as_ref() {
-            let frame = (position_seconds.max(0.0) * f64::from(track.sample_rate)) as usize;
-            let max_frame = track.samples.len() / 2;
-            self.cursor_frame
-                .store(frame.min(max_frame), Ordering::Relaxed);
+        self.ensure_stream()?;
+        let was_playing = self.playing.load(Ordering::Relaxed);
+        let Some(current) = self
+            .current
+            .lock()
+            .map_err(|err| err.to_string())?
+            .as_ref()
+            .cloned()
+        else {
+            return Ok(self.status());
+        };
+
+        let song = Song {
+            id: current.song_id.clone(),
+            file_path: current.file_path.clone(),
+            file_name: current.title.clone(),
+            file_type: file_extension(&current.file_path).unwrap_or_else(|| "mp3".to_string()),
+            title: Some(current.title.clone()),
+            artist: current.artist.clone(),
+            album: None,
+            album_artist: None,
+            genre: None,
+            year: None,
+            track_number: None,
+            disc_number: None,
+            duration_seconds: Some(current.duration_seconds),
+            bitrate: None,
+            sample_rate: Some(current.sample_rate as i64),
+            cover_art_path: None,
+            metadata_source: "player".to_string(),
+            date_added: String::new(),
+            last_played: None,
+            play_count: 0,
+        };
+
+        let output_rate = self.output_sample_rate()?;
+        let target_seconds = position_seconds.max(0.0);
+        let target_frame = (target_seconds * f64::from(output_rate)) as usize;
+        let request_epoch = self.play_request_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        self.stop_current(false);
+        let core = Arc::new(PlaybackCore::new(song, output_rate));
+        spawn_decode_worker(Arc::clone(&core), DecodeStart::AtSeconds(target_seconds));
+        let min_frames = (output_rate as f32 * START_BUFFER_SECONDS) as usize;
+        core.wait_until_primed(min_frames, Duration::from_millis(900));
+
+        if self.play_request_epoch.load(Ordering::Relaxed) != request_epoch {
+            core.request_stop();
+            return Ok(self.status());
         }
+
+        *self.current.lock().map_err(|err| err.to_string())? = Some(core);
+        self.cursor_frame.store(target_frame, Ordering::Relaxed);
+        self.playing.store(was_playing, Ordering::Relaxed);
         Ok(self.status())
     }
 
     pub fn set_volume(&self, volume: f32) -> Result<PlayerStatus, String> {
-        *self.volume.write().map_err(|err| err.to_string())? = volume.clamp(0.0, 1.0);
+        self.volume_bits
+            .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         Ok(self.status())
     }
 
     pub fn status(&self) -> PlayerStatus {
-        let current = self.current.read().ok().and_then(|guard| guard.clone());
-        let volume = self.volume.read().map(|guard| *guard).unwrap_or(0.8);
+        let current = self.current.lock().ok().and_then(|guard| guard.clone());
+        let volume = f32::from_bits(self.volume_bits.load(Ordering::Relaxed));
         if let Some(track) = current {
             let position_seconds =
                 self.cursor_frame.load(Ordering::Relaxed) as f64 / f64::from(track.sample_rate);
             PlayerStatus {
-                song_id: Some(track.song_id),
-                title: Some(track.title),
-                artist: track.artist,
+                song_id: Some(track.song_id.clone()),
+                title: Some(track.title.clone()),
+                artist: track.artist.clone(),
                 is_playing: self.playing.load(Ordering::Relaxed),
                 position_seconds,
                 duration_seconds: track.duration_seconds,
@@ -323,55 +478,23 @@ impl Player {
         self.last_frame.lock().ok().and_then(|guard| guard.clone())
     }
 
+    fn stop_current(&self, stop_visualizer: bool) {
+        self.playing.store(false, Ordering::Relaxed);
+        if stop_visualizer {
+            self.visualizer_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut current) = self.current.lock() {
+            if let Some(core) = current.take() {
+                core.request_stop();
+            }
+        }
+    }
+
     fn output_sample_rate(&self) -> Result<u32, String> {
         self.output_sample_rate
             .lock()
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "Audio output is not initialized".to_string())
-    }
-
-    fn get_or_decode_song(
-        &self,
-        song: &Song,
-        output_rate: u32,
-        cache_key: &str,
-    ) -> Result<DecodedTrack, String> {
-        if let Some(decoded) = self
-            .decode_cache
-            .lock()
-            .map_err(|err| err.to_string())?
-            .get(cache_key)
-        {
-            return Ok(decoded);
-        }
-
-        let slot = Arc::new(DecodeSlot::new());
-        let existing_slot = {
-            let mut cache = self.decode_cache.lock().map_err(|err| err.to_string())?;
-            if let Some(decoded) = cache.get(cache_key) {
-                return Ok(decoded);
-            }
-            if let Some(slot) = cache.in_flight.get(cache_key) {
-                Some(Arc::clone(slot))
-            } else {
-                cache.insert_in_flight(cache_key.to_string(), Arc::clone(&slot));
-                None
-            }
-        };
-
-        if let Some(slot) = existing_slot {
-            return slot.wait();
-        }
-
-        let decoded = decode_audio_file(Path::new(&song.file_path), output_rate).map(|decoded| {
-            DecodedTrack {
-                samples: Arc::new(decoded.samples),
-                sample_rate: decoded.sample_rate,
-                duration_seconds: decoded.duration_seconds,
-            }
-        });
-        finish_decode(&self.decode_cache, cache_key, &slot, decoded.clone());
-        decoded
     }
 
     fn ensure_stream(&self) -> Result<(), String> {
@@ -420,14 +543,21 @@ impl Player {
         let current = Arc::clone(&self.current);
         let cursor = Arc::clone(&self.cursor_frame);
         let playing = Arc::clone(&self.playing);
-        let volume = Arc::clone(&self.volume);
+        let volume_bits = Arc::clone(&self.volume_bits);
         let output_channels = config.channels as usize;
 
         device
             .build_output_stream(
                 config,
                 move |data: &mut [T], _| {
-                    write_output_data(data, output_channels, &current, &cursor, &playing, &volume);
+                    write_output_data(
+                        data,
+                        output_channels,
+                        &current,
+                        &cursor,
+                        &playing,
+                        &volume_bits,
+                    );
                 },
                 err_fn,
                 None,
@@ -461,21 +591,23 @@ impl Player {
                 }
 
                 if !playing.load(Ordering::Relaxed) {
+                    if let Some(core) = current.lock().ok().and_then(|guard| guard.clone()) {
+                        if core.finished.load(Ordering::Relaxed) && core.buffered_frames() == 0 {
+                            break;
+                        }
+                    }
                     continue;
                 }
 
-                let track = match current.read().ok().and_then(|guard| guard.clone()) {
-                    Some(track) => track,
+                let core = match current.lock().ok().and_then(|guard| guard.clone()) {
+                    Some(core) => core,
                     None => break,
                 };
 
                 let frame_index = cursor.load(Ordering::Relaxed);
-                if frame_index >= track.samples.len() / 2 {
-                    break;
-                }
-
                 let frame = build_visualizer_frame(
-                    &track,
+                    &core.rolling_samples(),
+                    core.sample_rate,
                     frame_index,
                     &mut smoothed_bins,
                     &mut smoothed_vocal_bins,
@@ -491,6 +623,10 @@ impl Player {
                     *guard = Some(frame.clone());
                 }
                 let _ = app.emit("visualizer-frame", frame);
+
+                if core.finished.load(Ordering::Relaxed) && core.buffered_frames() == 0 {
+                    break;
+                }
             }
         });
     }
@@ -499,36 +635,35 @@ impl Player {
 fn write_output_data<T>(
     output: &mut [T],
     output_channels: usize,
-    current: &Arc<RwLock<Option<TrackAudio>>>,
+    current: &Arc<Mutex<Option<Arc<PlaybackCore>>>>,
     cursor: &Arc<AtomicUsize>,
     playing: &Arc<AtomicBool>,
-    volume: &Arc<RwLock<f32>>,
+    volume_bits: &Arc<AtomicU32>,
 ) where
     T: Sample + FromSample<f32>,
 {
-    let track = current.read().ok().and_then(|guard| guard.clone());
-    let volume = volume.read().map(|guard| *guard).unwrap_or(0.8);
+    let core = current.lock().ok().and_then(|guard| guard.clone());
+    let volume = f32::from_bits(volume_bits.load(Ordering::Relaxed));
+    let mut ring = core.as_ref().and_then(|core| core.ring.lock().ok());
 
     for frame in output.chunks_mut(output_channels) {
-        let (left, right) = if playing.load(Ordering::Relaxed) {
-            if let Some(track) = track.as_ref() {
-                let frame_index = cursor.fetch_add(1, Ordering::Relaxed);
-                let sample_index = frame_index * 2;
-                if sample_index + 1 < track.samples.len() {
-                    (
-                        track.samples[sample_index] * volume,
-                        track.samples[sample_index + 1] * volume,
-                    )
-                } else {
+        let mut left = 0.0;
+        let mut right = 0.0;
+        let mut consumed = false;
+
+        if playing.load(Ordering::Relaxed) {
+            if let (Some(core), Some(ring)) = (core.as_ref(), ring.as_mut()) {
+                if ring.len() >= 2 {
+                    left = ring.pop_front().unwrap_or(0.0) * volume;
+                    right = ring.pop_front().unwrap_or(0.0) * volume;
+                    consumed = true;
+                    core.append_rolling(left, right);
+                    cursor.fetch_add(1, Ordering::Relaxed);
+                } else if core.finished.load(Ordering::Relaxed) {
                     playing.store(false, Ordering::Relaxed);
-                    (0.0, 0.0)
                 }
-            } else {
-                (0.0, 0.0)
             }
-        } else {
-            (0.0, 0.0)
-        };
+        }
 
         for (channel, sample) in frame.iter_mut().enumerate() {
             let value = match channel {
@@ -538,97 +673,201 @@ fn write_output_data<T>(
             };
             *sample = T::from_sample(value.clamp(-1.0, 1.0));
         }
-    }
-}
 
-struct DecodedAudio {
-    samples: Vec<f32>,
-    sample_rate: u32,
-    duration_seconds: f64,
-}
-
-fn decoded_cache_key(song_id: &str, output_rate: u32) -> String {
-    format!("{song_id}:{output_rate}")
-}
-
-fn finish_decode(
-    decode_cache: &Arc<Mutex<DecodedTrackCache>>,
-    cache_key: &str,
-    slot: &Arc<DecodeSlot>,
-    decoded: Result<DecodedTrack, String>,
-) {
-    if let Ok(mut result) = slot.result.lock() {
-        *result = Some(decoded.clone());
-        slot.ready.notify_all();
-    }
-
-    if let Ok(mut cache) = decode_cache.lock() {
-        cache.in_flight.remove(cache_key);
-        if let Ok(decoded) = decoded {
-            cache.insert(cache_key.to_string(), decoded);
+        if consumed {
+            if let Some(core) = core.as_ref() {
+                core.space_available.notify_one();
+            }
         }
     }
 }
 
-fn decode_audio_file(path: &Path, output_sample_rate: u32) -> Result<DecodedAudio, String> {
-    let file = File::open(path).map_err(|err| err.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
-        hint.with_extension(extension);
-    }
+enum DecodeStart {
+    AfterOutputFrames(usize),
+    AtSeconds(f64),
+}
 
-    let probed = symphonia::default::get_probe()
-        .probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )
-        .map_err(|err| err.to_string())?;
-    let mut format = probed;
-    let track = format
-        .default_track(TrackType::Audio)
-        .ok_or_else(|| "No default audio track found".to_string())?;
-    let codec_params = match &track.codec_params {
-        Some(CodecParameters::Audio(params)) => params.clone(),
-        _ => return Err("Default track is not an audio track".to_string()),
+fn spawn_decode_worker(core: Arc<PlaybackCore>, start: DecodeStart) {
+    thread::spawn(move || {
+        let result = stream_decode_to_core(&core, start);
+        if let Err(error) = result {
+            eprintln!("audio decode error: {error}");
+        }
+        core.finished.store(true, Ordering::Relaxed);
+        core.space_available.notify_all();
+    });
+}
+
+fn stream_decode_to_core(core: &PlaybackCore, start: DecodeStart) -> Result<(), String> {
+    let mut reader = AudioReader::open(Path::new(&core.file_path), core.sample_rate)?;
+    let mut packet_samples = Vec::new();
+    let mut skip_samples = match start {
+        DecodeStart::AfterOutputFrames(frames) => frames.saturating_mul(2),
+        DecodeStart::AtSeconds(seconds) => reader.seek_to_seconds(seconds),
     };
-    let sample_rate = codec_params.sample_rate.unwrap_or(output_sample_rate);
-    let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
-        .map_err(|err| err.to_string())?;
-    let track_id = track.id;
 
-    let mut samples = Vec::new();
-    while let Ok(Some(packet)) = format.next_packet() {
-        if packet.track_id != track_id {
+    while !core.stop_requested.load(Ordering::Relaxed) {
+        packet_samples.clear();
+        if !reader.decode_next_packet(&mut packet_samples)? {
+            break;
+        }
+        if packet_samples.is_empty() {
             continue;
         }
 
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(_) => continue,
+        if skip_samples > 0 {
+            let drop_count = skip_samples.min(packet_samples.len());
+            skip_samples -= drop_count;
+            if drop_count == packet_samples.len() {
+                continue;
+            }
+            core.push_samples_blocking(&packet_samples[drop_count..]);
+        } else {
+            core.push_samples_blocking(&packet_samples);
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_warm_start(
+    song: &Song,
+    output_rate: u32,
+    seconds: f32,
+    cancel: &AtomicBool,
+) -> Result<Vec<f32>, String> {
+    let mut reader = AudioReader::open(Path::new(&song.file_path), output_rate)?;
+    let target_samples = ((output_rate as f32 * seconds) as usize).max(1) * 2;
+    let mut output = Vec::with_capacity(target_samples);
+    let mut packet_samples = Vec::new();
+
+    while output.len() < target_samples && !cancel.load(Ordering::Relaxed) {
+        packet_samples.clear();
+        if !reader.decode_next_packet(&mut packet_samples)? {
+            break;
+        }
+        let remaining = target_samples - output.len();
+        output.extend(packet_samples.iter().take(remaining).copied());
+    }
+
+    Ok(output)
+}
+
+struct AudioReader {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn AudioDecoder>,
+    track_id: u32,
+    time_base: Option<TimeBase>,
+    source_sample_rate: u32,
+    output_sample_rate: u32,
+}
+
+impl AudioReader {
+    fn open(path: &Path, output_sample_rate: u32) -> Result<Self, String> {
+        let file = File::open(path).map_err(|err| err.to_string())?;
+        let mss = MediaSourceStream::new(
+            Box::new(file),
+            MediaSourceStreamOptions {
+                buffer_len: MEDIA_BUFFER_LEN,
+            },
+        );
+        let mut hint = Hint::new();
+        if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+            hint.with_extension(extension);
+        }
+
+        let format = symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|err| err.to_string())?;
+        let track = format
+            .default_track(TrackType::Audio)
+            .ok_or_else(|| "No default audio track found".to_string())?;
+        let time_base = track.time_base;
+        let codec_params = match &track.codec_params {
+            Some(CodecParameters::Audio(params)) => params.clone(),
+            _ => return Err("Default track is not an audio track".to_string()),
         };
-        append_stereo_samples(&mut samples, decoded)?;
+        let source_sample_rate = codec_params.sample_rate.unwrap_or(output_sample_rate);
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
+            .map_err(|err| err.to_string())?;
+        let track_id = track.id;
+
+        Ok(Self {
+            format,
+            decoder,
+            track_id,
+            time_base,
+            source_sample_rate,
+            output_sample_rate,
+        })
     }
 
-    if samples.is_empty() {
-        return Err("Audio file decoded to zero samples".to_string());
+    fn seek_to_seconds(&mut self, seconds: f64) -> usize {
+        if seconds <= 0.0 {
+            return 0;
+        }
+
+        let fallback_frames = (seconds * f64::from(self.output_sample_rate)) as usize;
+        let Some(time) = Time::try_from_secs_f64(seconds) else {
+            return fallback_frames.saturating_mul(2);
+        };
+
+        let seeked = self.format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: Some(self.track_id),
+            },
+        );
+
+        let Ok(seeked) = seeked else {
+            return fallback_frames.saturating_mul(2);
+        };
+
+        self.decoder.reset();
+
+        let actual_seconds = self
+            .time_base
+            .and_then(|time_base| time_base.calc_time(seeked.actual_ts))
+            .map(|time| time.as_secs_f64())
+            .unwrap_or(0.0);
+        let trim_seconds = (seconds - actual_seconds).max(0.0);
+        let trim_frames = (trim_seconds * f64::from(self.output_sample_rate)) as usize;
+        trim_frames.saturating_mul(2)
     }
 
-    let samples = if sample_rate == output_sample_rate {
-        samples
-    } else {
-        resample_stereo_linear(&samples, sample_rate, output_sample_rate)
-    };
-    let duration_seconds = samples.len() as f64 / 2.0 / f64::from(output_sample_rate);
+    fn decode_next_packet(&mut self, output: &mut Vec<f32>) -> Result<bool, String> {
+        loop {
+            let Some(packet) = self.format.next_packet().map_err(|err| err.to_string())? else {
+                return Ok(false);
+            };
+            if packet.track_id != self.track_id {
+                continue;
+            }
 
-    Ok(DecodedAudio {
-        samples,
-        sample_rate: output_sample_rate,
-        duration_seconds,
-    })
+            let decoded = match self.decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                Err(_) => continue,
+            };
+            append_stereo_samples(output, decoded)?;
+            if self.source_sample_rate != self.output_sample_rate {
+                let resampled = resample_stereo_linear(
+                    output,
+                    self.source_sample_rate,
+                    self.output_sample_rate,
+                );
+                output.clear();
+                output.extend(resampled);
+            }
+            return Ok(true);
+        }
+    }
 }
 
 fn append_stereo_samples(
@@ -681,8 +920,34 @@ fn resample_stereo_linear(samples: &[f32], source_rate: u32, target_rate: u32) -
     output
 }
 
+fn warm_cache_key(song_id: &str, output_rate: u32) -> String {
+    format!("{song_id}:{output_rate}")
+}
+
+fn validate_playable_file(song: &Song) -> Result<(), String> {
+    let file_type = song.file_type.to_ascii_lowercase();
+    if matches!(file_type.as_str(), "mp3" | "wav") {
+        return Ok(());
+    }
+
+    let extension = file_extension(&song.file_path).unwrap_or(file_type);
+    if matches!(extension.as_str(), "mp3" | "wav") {
+        Ok(())
+    } else {
+        Err("Only MP3 and WAV playback are supported.".to_string())
+    }
+}
+
+fn file_extension(path: &str) -> Option<String> {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
 fn build_visualizer_frame(
-    track: &TrackAudio,
+    samples: &[f32],
+    sample_rate: u32,
     cursor_frame: usize,
     smoothed_bins: &mut [f32],
     smoothed_vocal_bins: &mut [f32],
@@ -694,18 +959,17 @@ fn build_visualizer_frame(
     mono: &mut Vec<f32>,
     fft_buffer: &mut Vec<Complex32>,
 ) -> VisualizerFrame {
-    let total_frames = track.samples.len() / 2;
-    let start = cursor_frame.saturating_sub(FFT_SIZE / 2);
-    let end = (start + FFT_SIZE).min(total_frames);
+    let total_frames = samples.len() / 2;
+    let start = total_frames.saturating_sub(FFT_SIZE);
     mono.fill(0.0);
     let mut waveform = Vec::with_capacity(128);
     let mut left_acc = 0.0;
     let mut right_acc = 0.0;
     let mut mono_sum = 0.0;
 
-    for (index, frame_index) in (start..end).enumerate() {
-        let left = track.samples[frame_index * 2];
-        let right = track.samples[frame_index * 2 + 1];
+    for (index, frame_index) in (start..total_frames).enumerate() {
+        let left = samples[frame_index * 2];
+        let right = samples[frame_index * 2 + 1];
         let mixed = (left + right) * 0.5;
         mono[index] = mixed;
         mono_sum += mixed;
@@ -713,9 +977,9 @@ fn build_visualizer_frame(
         right_acc += right.abs();
     }
 
-    let sample_count = (end - start).max(1) as f32;
+    let sample_count = (total_frames - start).max(1) as f32;
     let dc_offset = mono_sum / sample_count;
-    for index in 0..(end - start) {
+    for index in 0..(total_frames - start) {
         let window =
             0.5 - 0.5 * ((2.0 * std::f32::consts::PI * index as f32) / FFT_SIZE as f32).cos();
         mono[index] = (mono[index] - dc_offset) * window;
@@ -730,13 +994,11 @@ fn build_visualizer_frame(
     fft_buffer.extend(mono.iter().map(|&sample| Complex32::new(sample, 0.0)));
     fft.process(fft_buffer);
 
-    let frequency_bins =
-        build_log_frequency_bins(fft_buffer, track.sample_rate, smoothed_bins, peaks);
-    let vocal_bins = build_vocal_bins(fft_buffer, track.sample_rate, smoothed_vocal_bins);
-    let raw_bass =
-        normalized_fft_range_energy(fft_buffer, track.sample_rate, BASS_LOW_HZ, BASS_HIGH_HZ);
+    let frequency_bins = build_log_frequency_bins(fft_buffer, sample_rate, smoothed_bins, peaks);
+    let vocal_bins = build_vocal_bins(fft_buffer, sample_rate, smoothed_vocal_bins);
+    let raw_bass = normalized_fft_range_energy(fft_buffer, sample_rate, BASS_LOW_HZ, BASS_HIGH_HZ);
     let bass_pulse_value = update_bass_pulse(raw_bass, bass_floor, bass_peak, bass_pulse);
-    let max_frequency = visualizer_max_frequency(track.sample_rate);
+    let max_frequency = visualizer_max_frequency(sample_rate);
     let bass = raw_bass;
     let mids = average_range_by_hz(&frequency_bins, VOCAL_LOW_HZ, VOCAL_HIGH_HZ, max_frequency);
     let treble = average_range_by_hz(&frequency_bins, 4_000.0, 16_000.0, max_frequency);
@@ -745,7 +1007,7 @@ fn build_visualizer_frame(
     let volume = ((left_level + right_level) * 0.5).clamp(0.0, 1.0);
 
     VisualizerFrame {
-        timestamp: cursor_frame as f64 / f64::from(track.sample_rate),
+        timestamp: cursor_frame as f64 / f64::from(sample_rate),
         volume,
         bass_pulse: bass_pulse_value,
         bass,
