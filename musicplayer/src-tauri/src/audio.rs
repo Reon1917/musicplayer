@@ -3,7 +3,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
 use std::thread;
 use std::time::Duration;
@@ -125,10 +125,10 @@ pub struct VisualizerFrame {
 }
 
 pub struct Player {
-    current: Arc<Mutex<Option<TrackAudio>>>,
+    current: Arc<RwLock<Option<TrackAudio>>>,
     cursor_frame: Arc<AtomicUsize>,
     playing: Arc<AtomicBool>,
-    volume: Arc<Mutex<f32>>,
+    volume: Arc<RwLock<f32>>,
     stream: Mutex<Option<Stream>>,
     output_sample_rate: Mutex<Option<u32>>,
     last_frame: Arc<Mutex<Option<VisualizerFrame>>>,
@@ -140,10 +140,10 @@ pub struct Player {
 impl Player {
     pub fn new() -> Self {
         Self {
-            current: Arc::new(Mutex::new(None)),
+            current: Arc::new(RwLock::new(None)),
             cursor_frame: Arc::new(AtomicUsize::new(0)),
             playing: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(Mutex::new(0.8)),
+            volume: Arc::new(RwLock::new(0.8)),
             stream: Mutex::new(None),
             output_sample_rate: Mutex::new(None),
             last_frame: Arc::new(Mutex::new(None)),
@@ -167,7 +167,7 @@ impl Player {
             samples: decoded.samples,
         };
 
-        *self.current.lock().map_err(|err| err.to_string())? = Some(track);
+        *self.current.write().map_err(|err| err.to_string())? = Some(track);
         self.cursor_frame.store(0, Ordering::Relaxed);
         self.playing.store(true, Ordering::Relaxed);
         let epoch = self.visualizer_epoch.fetch_add(1, Ordering::Relaxed) + 1;
@@ -230,7 +230,7 @@ impl Player {
     pub fn resume(&self) -> Result<PlayerStatus, String> {
         if self
             .current
-            .lock()
+            .read()
             .map_err(|err| err.to_string())?
             .is_some()
         {
@@ -246,7 +246,7 @@ impl Player {
     }
 
     pub fn seek(&self, position_seconds: f64) -> Result<PlayerStatus, String> {
-        if let Some(track) = self.current.lock().map_err(|err| err.to_string())?.as_ref() {
+        if let Some(track) = self.current.read().map_err(|err| err.to_string())?.as_ref() {
             let frame = (position_seconds.max(0.0) * f64::from(track.sample_rate)) as usize;
             let max_frame = track.samples.len() / 2;
             self.cursor_frame
@@ -256,13 +256,13 @@ impl Player {
     }
 
     pub fn set_volume(&self, volume: f32) -> Result<PlayerStatus, String> {
-        *self.volume.lock().map_err(|err| err.to_string())? = volume.clamp(0.0, 1.0);
+        *self.volume.write().map_err(|err| err.to_string())? = volume.clamp(0.0, 1.0);
         Ok(self.status())
     }
 
     pub fn status(&self) -> PlayerStatus {
-        let current = self.current.lock().ok().and_then(|guard| guard.clone());
-        let volume = self.volume.lock().map(|guard| *guard).unwrap_or(0.8);
+        let current = self.current.read().ok().and_then(|guard| guard.clone());
+        let volume = self.volume.read().map(|guard| *guard).unwrap_or(0.8);
         if let Some(track) = current {
             let position_seconds =
                 self.cursor_frame.load(Ordering::Relaxed) as f64 / f64::from(track.sample_rate);
@@ -404,6 +404,8 @@ impl Player {
             let mut bass_pulse = 0.0;
             let mut planner = FftPlanner::<f32>::new();
             let fft = planner.plan_fft_forward(FFT_SIZE);
+            let mut mono = vec![0.0; FFT_SIZE];
+            let mut fft_buffer: Vec<Complex32> = Vec::with_capacity(FFT_SIZE);
 
             loop {
                 thread::sleep(Duration::from_millis(33));
@@ -411,7 +413,11 @@ impl Player {
                     break;
                 }
 
-                let track = match current.lock().ok().and_then(|guard| guard.clone()) {
+                if !playing.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                let track = match current.read().ok().and_then(|guard| guard.clone()) {
                     Some(track) => track,
                     None => break,
                 };
@@ -431,15 +437,13 @@ impl Player {
                     &mut bass_peak,
                     &mut bass_pulse,
                     fft.as_ref(),
+                    &mut mono,
+                    &mut fft_buffer,
                 );
                 if let Ok(mut guard) = last_frame.lock() {
                     *guard = Some(frame.clone());
                 }
                 let _ = app.emit("visualizer-frame", frame);
-
-                if !playing.load(Ordering::Relaxed) {
-                    continue;
-                }
             }
         });
     }
@@ -448,15 +452,15 @@ impl Player {
 fn write_output_data<T>(
     output: &mut [T],
     output_channels: usize,
-    current: &Arc<Mutex<Option<TrackAudio>>>,
+    current: &Arc<RwLock<Option<TrackAudio>>>,
     cursor: &Arc<AtomicUsize>,
     playing: &Arc<AtomicBool>,
-    volume: &Arc<Mutex<f32>>,
+    volume: &Arc<RwLock<f32>>,
 ) where
     T: Sample + FromSample<f32>,
 {
-    let track = current.lock().ok().and_then(|guard| guard.clone());
-    let volume = volume.lock().map(|guard| *guard).unwrap_or(0.8);
+    let track = current.read().ok().and_then(|guard| guard.clone());
+    let volume = volume.read().map(|guard| *guard).unwrap_or(0.8);
 
     for frame in output.chunks_mut(output_channels) {
         let (left, right) = if playing.load(Ordering::Relaxed) {
@@ -621,11 +625,13 @@ fn build_visualizer_frame(
     bass_peak: &mut f32,
     bass_pulse: &mut f32,
     fft: &dyn rustfft::Fft<f32>,
+    mono: &mut Vec<f32>,
+    fft_buffer: &mut Vec<Complex32>,
 ) -> VisualizerFrame {
     let total_frames = track.samples.len() / 2;
     let start = cursor_frame.saturating_sub(FFT_SIZE / 2);
     let end = (start + FFT_SIZE).min(total_frames);
-    let mut mono = vec![0.0; FFT_SIZE];
+    mono.fill(0.0);
     let mut waveform = Vec::with_capacity(128);
     let mut left_acc = 0.0;
     let mut right_acc = 0.0;
@@ -654,16 +660,15 @@ fn build_visualizer_frame(
         waveform.push(mono[index]);
     }
 
-    let mut buffer: Vec<Complex32> = mono
-        .into_iter()
-        .map(|sample| Complex32::new(sample, 0.0))
-        .collect();
-    fft.process(&mut buffer);
+    fft_buffer.clear();
+    fft_buffer.extend(mono.iter().map(|&sample| Complex32::new(sample, 0.0)));
+    fft.process(fft_buffer);
 
-    let frequency_bins = build_log_frequency_bins(&buffer, track.sample_rate, smoothed_bins, peaks);
-    let vocal_bins = build_vocal_bins(&buffer, track.sample_rate, smoothed_vocal_bins);
+    let frequency_bins =
+        build_log_frequency_bins(fft_buffer, track.sample_rate, smoothed_bins, peaks);
+    let vocal_bins = build_vocal_bins(fft_buffer, track.sample_rate, smoothed_vocal_bins);
     let raw_bass =
-        normalized_fft_range_energy(&buffer, track.sample_rate, BASS_LOW_HZ, BASS_HIGH_HZ);
+        normalized_fft_range_energy(fft_buffer, track.sample_rate, BASS_LOW_HZ, BASS_HIGH_HZ);
     let bass_pulse_value = update_bass_pulse(raw_bass, bass_floor, bass_peak, bass_pulse);
     let max_frequency = visualizer_max_frequency(track.sample_rate);
     let bass = raw_bass;

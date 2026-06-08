@@ -18,22 +18,22 @@ pub fn scan_music_folder(path: &str) -> Result<Vec<Song>, String> {
         return Err("Selected path is not a folder".to_string());
     }
 
-    let mut songs = Vec::new();
-    for entry in WalkDir::new(root)
+    let songs = WalkDir::new(&root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        if !entry.file_type().is_file() || !is_supported_audio_file(path) {
-            continue;
-        }
-
-        match song_from_path(path) {
-            Ok(song) => songs.push(song),
-            Err(err) => eprintln!("Skipping {}: {err}", path.display()),
-        }
-    }
+        .filter(|entry| entry.file_type().is_file() && is_supported_audio_file(entry.path()))
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            match song_from_path(&path) {
+                Ok(song) => Some(song),
+                Err(err) => {
+                    eprintln!("Skipping {}: {err}", path.display());
+                    None
+                }
+            }
+        })
+        .collect();
 
     Ok(songs)
 }

@@ -59,6 +59,7 @@ impl Database {
         self.conn
             .execute_batch(
                 "
+                PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys = ON;
 
                 CREATE TABLE IF NOT EXISTS songs (
@@ -124,10 +125,14 @@ impl Database {
 
     pub fn upsert_songs(&self, songs: &[Song]) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
-        for song in songs {
-            self.conn
-                .execute(
-                    "
+        self.conn
+            .execute("BEGIN", [])
+            .map_err(|err| err.to_string())?;
+        let result = (|| -> Result<(), String> {
+            for song in songs {
+                self.conn
+                    .execute(
+                        "
                     INSERT INTO songs (
                       id, file_path, file_name, file_type, title, artist, album, album_artist,
                       genre, year, track_number, disc_number, duration_seconds, bitrate,
@@ -151,32 +156,41 @@ impl Database {
                       cover_art_path = COALESCE(songs.cover_art_path, excluded.cover_art_path),
                       updated_at = excluded.updated_at
                     ",
-                    params![
-                        song.id,
-                        song.file_path,
-                        song.file_name,
-                        song.file_type,
-                        song.title,
-                        song.artist,
-                        song.album,
-                        song.album_artist,
-                        song.genre,
-                        song.year,
-                        song.track_number,
-                        song.disc_number,
-                        song.duration_seconds,
-                        song.bitrate,
-                        song.sample_rate,
-                        song.cover_art_path,
-                        song.metadata_source,
-                        song.date_added,
-                        now,
-                        now,
-                    ],
-                )
-                .map_err(|err| err.to_string())?;
+                        params![
+                            song.id,
+                            song.file_path,
+                            song.file_name,
+                            song.file_type,
+                            song.title,
+                            song.artist,
+                            song.album,
+                            song.album_artist,
+                            song.genre,
+                            song.year,
+                            song.track_number,
+                            song.disc_number,
+                            song.duration_seconds,
+                            song.bitrate,
+                            song.sample_rate,
+                            song.cover_art_path,
+                            song.metadata_source,
+                            song.date_added,
+                            now,
+                            now,
+                        ],
+                    )
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(e);
         }
-        Ok(())
+        self.conn
+            .execute("COMMIT", [])
+            .map(|_| ())
+            .map_err(|err| err.to_string())
     }
 
     pub fn get_songs(&self) -> Result<Vec<Song>, String> {

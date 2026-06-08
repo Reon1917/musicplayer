@@ -86,6 +86,8 @@ function App() {
   const [metadataStatus, setMetadataStatus] = useState<string | undefined>();
   const [isSavingMetadata, setIsSavingMetadata] = useState(false);
   const preloadQueueRef = useRef<Set<string>>(new Set());
+  const lastStoreUpdateRef = useRef(0);
+  const canvasFrameRef = useRef<VisualizerFrame | undefined>(undefined);
 
   const selectedSong = useMemo(
     () => songs.find((song) => song.id === (selectedSongId ?? playerStatus.songId)) ?? songs[0],
@@ -116,6 +118,10 @@ function App() {
       .catch((error) => setScanError(String(error)));
 
     const unlisten = listen<VisualizerFrame>("visualizer-frame", (event) => {
+      canvasFrameRef.current = event.payload;
+      const now = performance.now();
+      if (now - lastStoreUpdateRef.current < 100) return;
+      lastStoreUpdateRef.current = now;
       setVisualizerFrame(event.payload);
       setPlayerStatus({
         ...useAppStore.getState().playerStatus,
@@ -395,6 +401,7 @@ function App() {
           <section className={clsx("visualizer-rack", `visual-mode-${visualizerMode}`)}>
             <VisualizerCanvas
               frame={visualizerFrame}
+              frameRef={canvasFrameRef}
               mode={visualizerMode}
               theme={theme}
             />
@@ -766,16 +773,17 @@ function TransportPanel({
 }
 
 function VisualizerCanvas({
-  frame,
+  frame: _frame,
+  frameRef,
   mode,
   theme,
 }: {
   frame?: VisualizerFrame;
+  frameRef: React.MutableRefObject<VisualizerFrame | undefined>;
   mode: VisualizerMode;
   theme: AppTheme;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const latestFrameRef = useRef<VisualizerFrame | undefined>(frame);
   const renderStateRef = useRef<VisualizerRenderState>({
     smoothedBars: [],
     peakBars: [],
@@ -788,11 +796,9 @@ function VisualizerCanvas({
     analyzerFloor: 0.02,
     phase: 0,
     lastTime: 0,
+    nextFrameArrival: 0,
+    lastRenderedTimestamp: -1,
   });
-
-  useEffect(() => {
-    latestFrameRef.current = frame;
-  }, [frame]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -811,22 +817,49 @@ function VisualizerCanvas({
       const scale = window.devicePixelRatio || 1;
       const deviceWidth = Math.max(1, Math.floor(rect.width * scale));
       const deviceHeight = Math.max(1, Math.floor(rect.height * scale));
-      if (deviceWidth !== lastDeviceWidth || deviceHeight !== lastDeviceHeight) {
+      const needsResize = deviceWidth !== lastDeviceWidth || deviceHeight !== lastDeviceHeight;
+      if (needsResize) {
         activeCanvas.width = deviceWidth;
         activeCanvas.height = deviceHeight;
         lastDeviceWidth = deviceWidth;
         lastDeviceHeight = deviceHeight;
       }
 
+      const state = renderStateRef.current;
+      const incoming = frameRef.current;
+
+      if (incoming && incoming.timestamp !== state.nextFrame?.timestamp) {
+        const gap = state.nextFrame ? Math.abs(incoming.timestamp - state.nextFrame.timestamp) : 0;
+        state.prevFrame = gap > 1.0 ? undefined : state.nextFrame;
+        state.nextFrame = incoming;
+        state.nextFrameArrival = now;
+      }
+
+      let displayFrame: VisualizerFrame | undefined;
+      if (state.prevFrame && state.nextFrame) {
+        const frameIntervalMs = (state.nextFrame.timestamp - state.prevFrame.timestamp) * 1000;
+        const t = Math.min(1, (now - state.nextFrameArrival) / Math.max(frameIntervalMs, 16));
+        displayFrame = interpolateFrame(state.prevFrame, state.nextFrame, t);
+      } else {
+        displayFrame = state.nextFrame ?? state.prevFrame;
+      }
+
+      const displayTimestamp = displayFrame?.timestamp ?? -1;
+      if (displayTimestamp === state.lastRenderedTimestamp && !needsResize) {
+        animationFrame = window.requestAnimationFrame(render);
+        return;
+      }
+      state.lastRenderedTimestamp = displayTimestamp;
+
       activeContext.setTransform(scale, 0, 0, scale, 0, 0);
       drawVisualizer(
         activeContext,
         rect.width,
         rect.height,
-        latestFrameRef.current,
+        displayFrame,
         mode,
         theme,
-        renderStateRef.current,
+        state,
         now,
       );
       animationFrame = window.requestAnimationFrame(render);
@@ -851,6 +884,10 @@ type VisualizerRenderState = {
   analyzerFloor: number;
   phase: number;
   lastTime: number;
+  prevFrame?: VisualizerFrame;
+  nextFrame?: VisualizerFrame;
+  nextFrameArrival: number;
+  lastRenderedTimestamp: number;
 };
 
 function drawVisualizer(
@@ -2116,6 +2153,24 @@ function alphaColor(hex: string, alpha: number) {
 
 function lerp(from: number, to: number, amount: number) {
   return from + (to - from) * amount;
+}
+
+function interpolateFrame(prev: VisualizerFrame, next: VisualizerFrame, t: number): VisualizerFrame {
+  const ease = Math.min(1, Math.max(0, t));
+  return {
+    timestamp: lerp(prev.timestamp, next.timestamp, ease),
+    volume: lerp(prev.volume, next.volume, ease),
+    bassPulse: lerp(prev.bassPulse, next.bassPulse, ease),
+    bass: lerp(prev.bass, next.bass, ease),
+    mids: lerp(prev.mids, next.mids, ease),
+    treble: lerp(prev.treble, next.treble, ease),
+    leftLevel: lerp(prev.leftLevel, next.leftLevel, ease),
+    rightLevel: lerp(prev.rightLevel, next.rightLevel, ease),
+    frequencyBins: prev.frequencyBins.map((v, i) => lerp(v, next.frequencyBins[i] ?? v, ease)),
+    vocalBins: prev.vocalBins.map((v, i) => lerp(v, next.vocalBins[i] ?? v, ease)),
+    waveform: prev.waveform.map((v, i) => lerp(v, next.waveform[i] ?? v, ease)),
+    peaks: prev.peaks.map((v, i) => lerp(v, next.peaks[i] ?? v, ease)),
+  };
 }
 
 function lerpColor(fromHex: string, toHex: string, amount: number) {

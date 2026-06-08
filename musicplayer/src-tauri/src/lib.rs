@@ -14,17 +14,22 @@ use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 struct AppState {
-    db: Mutex<Database>,
+    db: Arc<Mutex<Database>>,
     player: Arc<Player>,
 }
 
 #[tauri::command]
-fn scan_music_folder(path: String, state: State<'_, AppState>) -> Result<Vec<Song>, String> {
-    let songs = scanner::scan_music_folder(&path)?;
-    let db = state.db.lock().map_err(|err| err.to_string())?;
-    db.upsert_songs(&songs)?;
-    db.set_setting("last_music_folder", &path)?;
-    db.get_songs()
+async fn scan_music_folder(path: String, state: State<'_, AppState>) -> Result<Vec<Song>, String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let songs = scanner::scan_music_folder(&path)?;
+        let db = db.lock().map_err(|err| err.to_string())?;
+        db.upsert_songs(&songs)?;
+        db.set_setting("last_music_folder", &path)?;
+        db.get_songs()
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -33,14 +38,22 @@ fn get_songs(state: State<'_, AppState>) -> Result<Vec<Song>, String> {
 }
 
 #[tauri::command]
-fn rescan_music_folder(state: State<'_, AppState>) -> Result<Vec<Song>, String> {
-    let db = state.db.lock().map_err(|err| err.to_string())?;
-    let path = db
-        .get_setting("last_music_folder")?
-        .ok_or_else(|| "Choose a music folder before rescanning.".to_string())?;
-    let songs = scanner::scan_music_folder(&path)?;
-    db.upsert_songs(&songs)?;
-    db.get_songs()
+async fn rescan_music_folder(state: State<'_, AppState>) -> Result<Vec<Song>, String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = {
+            let db = db.lock().map_err(|err| err.to_string())?;
+            db.get_setting("last_music_folder")?
+                .ok_or_else(|| "Choose a music folder before rescanning.".to_string())?
+        };
+
+        let songs = scanner::scan_music_folder(&path)?;
+        let db = db.lock().map_err(|err| err.to_string())?;
+        db.upsert_songs(&songs)?;
+        db.get_songs()
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -157,7 +170,7 @@ pub fn run() {
                 .map_err(|err| format!("Failed to create app data directory: {err}"))?;
             let db = Database::open(app_data_dir.join("musicplayer.sqlite"))?;
             app.manage(AppState {
-                db: Mutex::new(db),
+                db: Arc::new(Mutex::new(db)),
                 player: Arc::new(Player::new()),
             });
             Ok(())
