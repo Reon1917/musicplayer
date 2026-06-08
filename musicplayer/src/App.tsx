@@ -62,6 +62,7 @@ function App() {
   const {
     songs,
     selectedSongId,
+    pendingSongId,
     playerStatus,
     visualizerFrame,
     visualizerMode,
@@ -71,6 +72,7 @@ function App() {
     isLoadingTrack,
     setSongs,
     setSelectedSongId,
+    setPendingSongId,
     setPlayerStatus,
     setVisualizerFrame,
     setVisualizerMode,
@@ -86,13 +88,19 @@ function App() {
   const [metadataStatus, setMetadataStatus] = useState<string | undefined>();
   const [isSavingMetadata, setIsSavingMetadata] = useState(false);
   const preloadQueueRef = useRef<Set<string>>(new Set());
+  const playRequestRef = useRef(0);
   const lastStoreUpdateRef = useRef(0);
   const canvasFrameRef = useRef<VisualizerFrame | undefined>(undefined);
 
   const selectedSong = useMemo(
-    () => songs.find((song) => song.id === (selectedSongId ?? playerStatus.songId)) ?? songs[0],
-    [playerStatus.songId, selectedSongId, songs],
+    () => songs.find((song) => song.id === selectedSongId) ?? songs[0],
+    [selectedSongId, songs],
   );
+  const nowPlayingSong = useMemo(
+    () => songs.find((song) => song.id === playerStatus.songId),
+    [playerStatus.songId, songs],
+  );
+  const displaySong = nowPlayingSong ?? selectedSong;
   const filteredSongs = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     if (!query) return songs;
@@ -281,16 +289,32 @@ function App() {
       return;
     }
     if (!song) return;
+    const requestId = playRequestRef.current + 1;
+    playRequestRef.current = requestId;
     setSelectedSongId(song.id);
+    setPendingSongId(song.id);
     setIsLoadingTrack(true);
     setScanError(undefined);
     try {
       const status = await invoke<PlayerStatus>("play_song", { songId: song.id });
+      if (playRequestRef.current !== requestId) return;
       setPlayerStatus(status);
     } catch (error) {
+      if (playRequestRef.current !== requestId) return;
       setScanError(String(error));
+      try {
+        const status = await invoke<PlayerStatus>("get_player_status");
+        if (playRequestRef.current === requestId) {
+          setPlayerStatus(status);
+        }
+      } catch {
+        // Keep the original playback error visible.
+      }
     } finally {
-      setIsLoadingTrack(false);
+      if (playRequestRef.current === requestId) {
+        setPendingSongId(undefined);
+        setIsLoadingTrack(false);
+      }
     }
   }
 
@@ -367,7 +391,7 @@ function App() {
           </div>
           <div className="title-marquee">
             <MarqueeLine
-              text={playerStatus.title ?? selectedSong?.title ?? selectedSong?.fileName ?? "No song loaded"}
+              text={playerStatus.title ?? nowPlayingSong?.title ?? displaySong?.title ?? displaySong?.fileName ?? "No song loaded"}
             />
           </div>
           <button className="icon-button" type="button" onClick={() => setIsSettingsOpen(true)}>
@@ -378,7 +402,8 @@ function App() {
         <div className="deck-grid">
           <aside className="left-rack">
             <CoverPanel
-              song={selectedSong}
+              song={displaySong}
+              isPreview={!nowPlayingSong && Boolean(selectedSong)}
               onEdit={() => {
                 setMetadataDraft(createMetadataDraft(selectedSong));
                 setMetadataStatus(undefined);
@@ -450,7 +475,9 @@ function App() {
           {scanError && <div className="error-line">{scanError}</div>}
           <SongTable
             songs={filteredSongs}
-            activeSongId={playerStatus.songId ?? selectedSongId}
+            selectedSongId={selectedSongId}
+            playingSongId={playerStatus.songId}
+            pendingSongId={pendingSongId}
             onSelect={(songId) => {
               setSelectedSongId(songId);
               preloadSong(songId);
@@ -487,7 +514,15 @@ function App() {
   );
 }
 
-function CoverPanel({ song, onEdit }: { song?: Song; onEdit: () => void }) {
+function CoverPanel({
+  song,
+  isPreview,
+  onEdit,
+}: {
+  song?: Song;
+  isPreview: boolean;
+  onEdit: () => void;
+}) {
   const coverUrl = song?.coverArtPath ? convertFileSrc(song.coverArtPath) : undefined;
 
   return (
@@ -496,6 +531,9 @@ function CoverPanel({ song, onEdit }: { song?: Song; onEdit: () => void }) {
         {coverUrl ? <img src={coverUrl} alt="" /> : <div className="cover-placeholder">LAPIS</div>}
       </div>
       <div className="song-readout">
+        <span className={clsx("playback-badge", isPreview && "preview")}>
+          {song ? (isPreview ? "Selected" : "Now playing") : "No track"}
+        </span>
         <MarqueeLine
           className="song-title-line"
           text={song?.title ?? song?.fileName ?? "No track selected"}
@@ -845,7 +883,11 @@ function VisualizerCanvas({
       }
 
       const displayTimestamp = displayFrame?.timestamp ?? -1;
-      if (displayTimestamp === state.lastRenderedTimestamp && !needsResize) {
+      const useHighFpsSmoothing =
+        Boolean(displayFrame) &&
+        (mode === "classicBars" || mode === "windowsScope" || mode === "waveform") &&
+        now - state.nextFrameArrival < 250;
+      if (!useHighFpsSmoothing && displayTimestamp === state.lastRenderedTimestamp && !needsResize) {
         animationFrame = window.requestAnimationFrame(render);
         return;
       }
@@ -908,25 +950,8 @@ function drawVisualizer(
 
   const { smoothedBars, peakBars } = renderState;
   context.clearRect(0, 0, width, height);
-  context.fillStyle = palette.panel;
+  context.fillStyle = "#000";
   context.fillRect(0, 0, width, height);
-  context.strokeStyle = mode === "windowsScope" ? palette.gridStrong : palette.grid;
-  context.lineWidth = 1;
-  for (let y = 16; y < height; y += 14) {
-    context.beginPath();
-    context.moveTo(0, y);
-    context.lineTo(width, y);
-    context.stroke();
-  }
-  if (mode === "radial") {
-    context.strokeStyle = palette.grid;
-    for (let x = 18; x < width; x += 28) {
-      context.beginPath();
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
-      context.stroke();
-    }
-  }
 
   if (!frame) {
     context.fillStyle = palette.muted;
@@ -938,10 +963,6 @@ function drawVisualizer(
   if (mode === "trapNation") {
     drawTrapPulse(context, width, height, frame, renderState, palette);
     return;
-  }
-
-  if (mode !== "wmpRibbons") {
-    drawRetroAudioAtmosphere(context, width, height, frame, palette, mode, renderState.phase);
   }
 
   if (mode === "waveform") {
@@ -972,10 +993,6 @@ function drawVisualizer(
   const blockHeight = mode === "windowsScope" ? 5 : 6;
   const blockGap = 2;
 
-  if (mode === "classicBars" || mode === "windowsScope") {
-    drawAnalyzerDeckMotion(context, width, height, frame, palette, mode, renderState.phase);
-  }
-
   if (mode === "wmpRibbons") {
     drawWmpRibbons(context, width, height, frame, palette, renderState.phase);
     return;
@@ -1003,19 +1020,29 @@ function drawVisualizer(
 
   const peakBins = selectVisualizerBands(frame.peaks, bandCount, mode);
   const waveformBands = selectWaveformEnvelopeBands(frame.waveform, bandCount, mode);
+  const waveformMotion = getWaveformMotion(frame);
   const analyzerTargets = bins.map((target, index) => {
     const center = (bins.length - 1) / 2;
     const centerWeight = mode === "classicBars" || mode === "windowsScope"
       ? Math.max(0, 1 - Math.abs(index - center) / Math.max(1, center))
       : 0;
+    const t = index / Math.max(1, bins.length - 1);
+    const sampleIndex = Math.round(t * Math.max(0, frame.waveform.length - 1));
+    const raw = Math.abs(smoothedWaveSample(frame.waveform, sampleIndex, 1));
+    const previousRaw = Math.abs(smoothedWaveSample(frame.waveform, Math.max(0, sampleIndex - 3), 1));
+    const nextRaw = Math.abs(smoothedWaveSample(frame.waveform, Math.min(frame.waveform.length - 1, sampleIndex + 3), 1));
+    const transient = Math.min(1, Math.abs(nextRaw - previousRaw) * 2.6);
     const peakTarget = peakBins[index] ?? 0;
     const waveformTarget = waveformBands[index] ?? 0;
-    const bassLift = Math.pow(frame.bassPulse ?? 0, 1.8) * centerWeight * 0.28;
-    const melodicLift = frame.mids * (1 - centerWeight) * 0.09;
-    const levelLift = frame.volume * 0.035;
-    const frequencyTarget = target * (mode === "windowsScope" ? 1.05 : 1.16) + peakTarget * 0.54;
-    const motionTarget = waveformTarget * (mode === "windowsScope" ? 0.6 : 0.72);
-    return Math.max(0, frequencyTarget, motionTarget + levelLift, frequencyTarget + bassLift + melodicLift + levelLift);
+    const midFocus = Math.max(0, 1 - Math.abs(t - 0.58) / 0.36);
+    const edgeShape = Math.pow(Math.abs(t - 0.5) * 2, 1.15);
+    const bassLift = waveformMotion.bassAccent * centerWeight * 0.24;
+    const riffLift = waveformMotion.riffEnergy * midFocus * 0.36 + transient * waveformMotion.riffFocus * 0.26;
+    const vocalLift = waveformMotion.vocalFlow * Math.max(0, 1 - Math.abs(t - 0.5) / 0.5) * 0.16;
+    const frequencyTarget = target * (mode === "windowsScope" ? 0.62 : 0.72) + peakTarget * 0.26;
+    const motionTarget = Math.max(raw * 1.18, waveformTarget * 0.92) + transient * (0.2 + waveformMotion.rhythmPunch * 0.14);
+    const levelLift = frame.volume * 0.04 + edgeShape * 0.014;
+    return Math.max(0, motionTarget + frequencyTarget + bassLift + riffLift + vocalLift + levelLift);
   });
   const audibleEnergy = Math.max(frame.volume, frame.bassPulse ?? 0, frame.mids, frame.treble);
   const analyzerPeak = Math.max(0.012, audibleEnergy * 0.36, ...analyzerTargets);
@@ -1034,7 +1061,9 @@ function drawVisualizer(
       ? Math.min(0.34, 0.045 + audibleEnergy * 4.2 + waveformDetail * 0.22)
       : 0;
     const shapedTarget = Math.max(detailFloor, Math.pow(normalized, mode === "windowsScope" ? 0.9 : 0.78) * 0.98);
-    const attack = shapedTarget > current ? 0.42 : 0.16;
+    const attack = shapedTarget > current
+      ? 0.48 + waveformMotion.riffFocus * 0.18 + waveformMotion.rhythmPunch * 0.06
+      : 0.16 + waveformMotion.vocalFocus * 0.04;
     const smoothed = current + (shapedTarget - current) * attack;
     smoothedBars[index] = smoothed;
     peakBars[index] = Math.max(smoothed, (peakBars[index] ?? 0) - 0.012);
@@ -1076,51 +1105,6 @@ function ensureVisualizerStateDefaults(renderState: VisualizerRenderState) {
   }
 }
 
-function drawAnalyzerDeckMotion(
-  context: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  frame: VisualizerFrame,
-  palette: ReturnType<typeof getPalette>,
-  mode: VisualizerMode,
-  phase: number,
-) {
-  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.85);
-  const lyricFlow = Math.min(1, frame.mids * 0.72 + frame.treble * 0.28);
-  const floor = height * 0.88;
-  const color = mode === "windowsScope" ? palette.windowsMid : palette.low;
-  const glow = context.createLinearGradient(0, height * 0.35, 0, height);
-  glow.addColorStop(0, "rgba(0,0,0,0)");
-  glow.addColorStop(0.64, alphaColor(color, 0.04 + lyricFlow * 0.06));
-  glow.addColorStop(1, alphaColor(palette.hot, 0.06 + bassAccent * 0.12));
-  context.fillStyle = glow;
-  context.fillRect(0, 0, width, height);
-
-  context.strokeStyle = alphaColor(color, 0.14 + lyricFlow * 0.12);
-  context.lineWidth = 1;
-  for (let lane = 0; lane < 7; lane += 1) {
-    const y = floor - lane * height * 0.085;
-    const offset = Math.sin(phase * 0.8 + lane) * width * 0.02;
-    context.beginPath();
-    context.moveTo(width * 0.18 + offset, y);
-    context.lineTo(width * 0.82 - offset, y - lyricFlow * lane * 2);
-    context.stroke();
-  }
-
-  context.globalCompositeOperation = "lighter";
-  const sparkCount = Math.round(frame.treble * 14 + bassAccent * 5);
-  for (let spark = 0; spark < sparkCount; spark += 1) {
-    const seed = spark * 23.71 + Math.floor(phase * 2.4) * 17.3;
-    const x = width * (0.16 + fract(Math.sin(seed) * 7789.3) * 0.68);
-    const y = height * (0.22 + fract(Math.sin(seed + 2.1) * 2927.9) * 0.5);
-    context.fillStyle = alphaColor(spark % 3 === 0 ? palette.hot : palette.peak, 0.16 + frame.treble * 0.32);
-    context.beginPath();
-    context.arc(x, y, 1.2 + frame.treble * 2.2, 0, Math.PI * 2);
-    context.fill();
-  }
-  context.globalCompositeOperation = "source-over";
-}
-
 function drawWmpRibbons(
   context: CanvasRenderingContext2D,
   width: number,
@@ -1140,23 +1124,15 @@ function drawWmpRibbons(
   const colors = [hudAmber, hudGreen, hudBlue, hudOrange, hudRed];
   const centerX = width / 2;
   const centerY = height / 2;
-  const bassAccent = Math.pow(frame.bassPulse ?? frame.bass, 1.55);
   const lyricFlow = Math.min(1, frame.mids * 0.72 + frame.treble * 0.32);
+  const bassAccent = Math.pow(frame.bassPulse ?? frame.bass, 1.55);
   const radiusBase = Math.min(width, height);
-
-  const aura = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radiusBase * 0.76);
-  aura.addColorStop(0, alphaColor(hudAmber, 0.08 + lyricFlow * 0.08));
-  aura.addColorStop(0.36, alphaColor(hudGreen, 0.1 + lyricFlow * 0.16));
-  aura.addColorStop(0.7, alphaColor(hudOrange, 0.045 + bassAccent * 0.08));
-  aura.addColorStop(1, "rgba(0,0,0,0)");
-  context.fillStyle = aura;
-  context.fillRect(0, 0, width, height);
 
   drawEvaHudOverlay(context, width, height, frame, phase, { hudOrange, hudAmber, hudGreen, hudRed, hudBlue });
 
   for (let ring = 0; ring < 7; ring += 1) {
     const t = ring / 6;
-    const radius = radiusBase * (0.12 + t * 0.34 + bassAccent * 0.012);
+    const radius = radiusBase * (0.12 + t * 0.34);
     const skew = 0.5 + Math.sin(phase * 0.58 + ring) * 0.08;
     context.save();
     context.translate(centerX, centerY);
@@ -1239,40 +1215,6 @@ function drawWmpRibbons(
   context.shadowBlur = 0;
   context.globalAlpha = 1;
   context.globalCompositeOperation = "source-over";
-}
-
-function drawRetroAudioAtmosphere(
-  context: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  frame: VisualizerFrame,
-  palette: ReturnType<typeof getPalette>,
-  mode: VisualizerMode,
-  phase: number,
-) {
-  const centerX = width / 2;
-  const centerY = height / 2;
-  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.75);
-  const flow = Math.min(1, frame.mids * 0.76 + frame.treble * 0.24);
-  const radius = Math.min(width, height);
-  const gradient = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius * 0.78);
-  gradient.addColorStop(0, alphaColor(palette.peak, mode === "windowsScope" ? 0.035 : 0.05 + flow * 0.05));
-  gradient.addColorStop(0.36, alphaColor(palette.low, 0.06 + flow * 0.1));
-  gradient.addColorStop(0.76, alphaColor(palette.hot, 0.025 + bassAccent * 0.08));
-  gradient.addColorStop(1, "rgba(0,0,0,0)");
-  context.fillStyle = gradient;
-  context.fillRect(0, 0, width, height);
-
-  context.strokeStyle = alphaColor(mode === "windowsScope" ? palette.windowsMid : palette.gridStrong, 0.08 + flow * 0.06);
-  context.lineWidth = 1;
-  for (let index = 0; index < 8; index += 1) {
-    const t = index / 7;
-    const y = height * (0.16 + t * 0.68);
-    context.beginPath();
-    context.moveTo(width * 0.12, y + Math.sin(phase + index) * 2);
-    context.lineTo(width * 0.88, y + Math.cos(phase * 0.7 + index) * 2);
-    context.stroke();
-  }
 }
 
 function drawEvaHudOverlay(
@@ -1425,7 +1367,7 @@ function drawTrapPulse(
 ) {
   const centerX = width / 2;
   const centerY = height / 2;
-  const bassPulse = frame.bassPulse ?? 0;
+  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.7);
   const lyricFlow = Math.min(1, frame.mids * 0.72 + frame.treble * 0.28);
   const halfCount = 30;
   const vocalBands = selectCenterOutBands(frame.vocalBins?.length ? frame.vocalBins : frame.frequencyBins, halfCount);
@@ -1437,16 +1379,7 @@ function drawTrapPulse(
   smoothedBars.length = totalBars;
   peakBars.length = totalBars;
 
-  const bassAccent = Math.pow(bassPulse, 1.7);
   const flowGlow = Math.pow(lyricFlow, 0.85);
-  const haloRadius = Math.min(width, height) * (0.2 + flowGlow * 0.08);
-  const halo = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, haloRadius * 2.9);
-  halo.addColorStop(0, `rgba(255, 255, 255, ${0.08 + bassAccent * 0.08})`);
-  halo.addColorStop(0.24, alphaColor(palette.iidxCyan, 0.18 + flowGlow * 0.26));
-  halo.addColorStop(0.58, alphaColor(palette.iidxViolet, 0.1 + lyricFlow * 0.22));
-  halo.addColorStop(1, "rgba(0,0,0,0)");
-  context.fillStyle = halo;
-  context.fillRect(0, 0, width, height);
 
   drawLyricRibbons(context, width, height, vocalBands, frame, renderState, palette, lyricFlow);
   drawBassBed(context, width, height, frame, palette);
@@ -1711,12 +1644,6 @@ function drawSpectrumRing(
   const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.8);
   const lyricFlow = Math.min(1, frame.mids * 0.72 + frame.treble * 0.28);
   const radius = Math.min(width, height) * (0.2 + bassAccent * 0.018);
-  const core = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius * 1.9);
-  core.addColorStop(0, alphaColor(palette.peak, 0.08 + lyricFlow * 0.08));
-  core.addColorStop(0.48, alphaColor(palette.iidxCyan, 0.08 + lyricFlow * 0.12));
-  core.addColorStop(1, "rgba(0,0,0,0)");
-  context.fillStyle = core;
-  context.fillRect(0, 0, width, height);
 
   context.lineWidth = 6 + bassAccent * 3;
   context.strokeStyle = alphaColor(palette.peak, 0.72);
@@ -1758,53 +1685,10 @@ function drawWaveform(
   _palette: ReturnType<typeof getPalette>,
   _phase: number,
 ) {
-  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.25);
+  const waveformMotion = getWaveformMotion(frame);
+  const { bassAccent, riffEnergy, vocalFlow, rhythmPunch, riffFocus, vocalFocus, songFlow } = waveformMotion;
   const bins = selectCenterOutBands(frame.frequencyBins, 96);
-  const orderedBins = trimVisualizerBins(frame.frequencyBins);
-  const riffBand = averageRange(orderedBins, 0.34, 0.76);
-  const riffPeak = averageRange(frame.peaks, 0.34, 0.76);
-  const vocalBand = averageRange(frame.vocalBins?.length ? frame.vocalBins : orderedBins, 0.22, 0.72);
-  const waveformDelta = averageWaveformDelta(frame.waveform);
-  const riffEnergy = Math.min(1, riffBand * 0.82 + riffPeak * 0.44 + waveformDelta * 0.5 + frame.treble * 0.16);
-  const vocalFlow = Math.min(1, vocalBand * 0.82 + frame.mids * 0.48 - waveformDelta * 0.16);
-  const rhythmPunch = Math.min(1, bassAccent * 0.52 + waveformDelta * 0.68 + riffPeak * 0.24);
-  const riffFocus = riffEnergy / Math.max(0.001, riffEnergy + vocalFlow);
-  const vocalFocus = 1 - riffFocus;
-  const songFlow = Math.min(1, frame.bass * 0.26 + frame.mids * 0.28 + frame.treble * 0.22 + bassAccent * 0.16 + riffEnergy * 0.32);
   const centerY = height / 2;
-  const centerX = width / 2;
-
-  const sky = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, Math.max(width, height) * 0.75);
-  sky.addColorStop(0, "#10222b");
-  sky.addColorStop(0.44, "#071122");
-  sky.addColorStop(1, "#02040b");
-  context.fillStyle = sky;
-  context.fillRect(0, 0, width, height);
-
-  context.globalCompositeOperation = "screen";
-  const starCount = 120;
-  for (let index = 0; index < starCount; index += 1) {
-    const seed = index * 37.719;
-    const x = fract(Math.sin(seed) * 43758.5453) * width;
-    const y = fract(Math.sin(seed + 9.13) * 24634.6345) * height;
-    const depth = fract(Math.sin(seed + 4.91) * 9812.331);
-    const starSize = 0.5 + depth * 1.05 + songFlow * 0.22;
-    const streak = depth > 0.78 ? 2.5 + depth * 4.2 + bassAccent * 1.4 : starSize;
-    context.globalAlpha = 0.14 + depth * 0.42;
-    context.fillStyle = depth > 0.82 ? "#fff0cf" : "#7fffe5";
-    context.beginPath();
-    context.ellipse(x, y, streak, starSize * 0.48, -0.25, 0, Math.PI * 2);
-    context.fill();
-  }
-
-  const nebula = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, Math.min(width, height) * 0.52);
-  nebula.addColorStop(0, alphaColor("#00ffc8", 0.08 + songFlow * 0.07));
-  nebula.addColorStop(0.48, alphaColor("#ff3fb7", 0.035 + bassAccent * 0.045));
-  nebula.addColorStop(1, "rgba(0,0,0,0)");
-  context.globalAlpha = 1;
-  context.fillStyle = nebula;
-  context.fillRect(0, 0, width, height);
-  context.globalCompositeOperation = "source-over";
 
   const barCount = 74;
   renderState.scopeWave.length = Math.max(renderState.scopeWave.length, barCount);
@@ -1878,15 +1762,6 @@ function drawWaveform(
     context.globalAlpha = 1;
   }
   context.shadowBlur = 0;
-
-  const pulse = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, width * 0.42);
-  pulse.addColorStop(0, alphaColor("#00ffd0", 0.035 + bassAccent * 0.03 + vocalFlow * 0.025));
-  pulse.addColorStop(0.45, alphaColor(riffFocus > 0.52 ? "#ffd45f" : "#ff3fb7", 0.018 + songFlow * 0.03 + riffEnergy * 0.025));
-  pulse.addColorStop(1, "rgba(0,0,0,0)");
-  context.globalCompositeOperation = "screen";
-  context.fillStyle = pulse;
-  context.fillRect(0, 0, width, height);
-  context.globalCompositeOperation = "source-over";
 
   context.strokeStyle = alphaColor("#fff0a8", 0.07 + songFlow * 0.07);
   context.lineWidth = 1;
@@ -1995,6 +1870,22 @@ function drawRadialDeck(
     context.stroke();
   });
   context.shadowBlur = 0;
+}
+
+function getWaveformMotion(frame: VisualizerFrame) {
+  const bassAccent = Math.pow(frame.bassPulse ?? 0, 1.25);
+  const orderedBins = trimVisualizerBins(frame.frequencyBins);
+  const riffBand = averageRange(orderedBins, 0.34, 0.76);
+  const riffPeak = averageRange(frame.peaks, 0.34, 0.76);
+  const vocalBand = averageRange(frame.vocalBins?.length ? frame.vocalBins : orderedBins, 0.22, 0.72);
+  const waveformDelta = averageWaveformDelta(frame.waveform);
+  const riffEnergy = Math.min(1, riffBand * 0.82 + riffPeak * 0.44 + waveformDelta * 0.5 + frame.treble * 0.16);
+  const vocalFlow = Math.min(1, vocalBand * 0.82 + frame.mids * 0.48 - waveformDelta * 0.16);
+  const rhythmPunch = Math.min(1, bassAccent * 0.52 + waveformDelta * 0.68 + riffPeak * 0.24);
+  const riffFocus = riffEnergy / Math.max(0.001, riffEnergy + vocalFlow);
+  const vocalFocus = 1 - riffFocus;
+  const songFlow = Math.min(1, frame.bass * 0.26 + frame.mids * 0.28 + frame.treble * 0.22 + bassAccent * 0.16 + riffEnergy * 0.32);
+  return { bassAccent, riffEnergy, vocalFlow, rhythmPunch, riffFocus, vocalFocus, songFlow };
 }
 
 function getVisualizerBandCount(mode: VisualizerMode) {
@@ -2218,13 +2109,17 @@ function Meter({ label, value }: { label: string; value: number }) {
 
 function SongTable({
   songs,
-  activeSongId,
+  selectedSongId,
+  playingSongId,
+  pendingSongId,
   onSelect,
   onPreload,
   onPlay,
 }: {
   songs: Song[];
-  activeSongId?: string | null;
+  selectedSongId?: string | null;
+  playingSongId?: string | null;
+  pendingSongId?: string | null;
   onSelect: (songId: string) => void;
   onPreload: (songId: string) => void;
   onPlay: (song: Song) => void;
@@ -2235,22 +2130,43 @@ function SongTable({
 
   return (
     <div className="song-table">
-      {songs.map((song, index) => (
-        <button
-          key={song.id}
-          className={clsx("song-row", song.id === activeSongId && "active")}
-          type="button"
-          onClick={() => onSelect(song.id)}
-          onPointerEnter={() => onPreload(song.id)}
-          onFocus={() => onPreload(song.id)}
-          onDoubleClick={() => onPlay(song)}
-        >
-          <span>{String(index + 1).padStart(2, "0")}</span>
-          <strong>{song.title ?? song.fileName}</strong>
-          <em>{song.artist ?? "Unknown Artist"}</em>
-          <small>{formatTime(song.durationSeconds ?? 0)}</small>
-        </button>
-      ))}
+      {songs.map((song, index) => {
+        const isSelected = song.id === selectedSongId;
+        const isPlaying = song.id === playingSongId;
+        const isPending = song.id === pendingSongId;
+
+        return (
+          <button
+            key={song.id}
+            className={clsx(
+              "song-row",
+              isSelected && "selected",
+              isPlaying && "playing",
+              isPending && "pending",
+            )}
+            type="button"
+            onClick={() => onSelect(song.id)}
+            onPointerEnter={() => onPreload(song.id)}
+            onFocus={() => onPreload(song.id)}
+            onDoubleClick={() => {
+              if (!isPending) onPlay(song);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                if (!isPending) onPlay(song);
+              }
+            }}
+          >
+            <span className="row-index">
+              {isPending ? "..." : isPlaying ? ">" : String(index + 1).padStart(2, "0")}
+            </span>
+            <strong>{song.title ?? song.fileName}</strong>
+            <em>{song.artist ?? "Unknown Artist"}</em>
+            <small>{isPending ? "Loading" : formatTime(song.durationSeconds ?? 0)}</small>
+          </button>
+        );
+      })}
     </div>
   );
 }

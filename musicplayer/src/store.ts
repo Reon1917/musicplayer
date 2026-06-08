@@ -10,6 +10,7 @@ import type {
 type AppStore = {
   songs: Song[];
   selectedSongId?: string;
+  pendingSongId?: string;
   playerStatus: PlayerStatus;
   visualizerFrame?: VisualizerFrame;
   visualizerMode: VisualizerMode;
@@ -19,6 +20,7 @@ type AppStore = {
   isLoadingTrack: boolean;
   setSongs: (songs: Song[]) => void;
   setSelectedSongId: (songId?: string) => void;
+  setPendingSongId: (songId?: string) => void;
   setPlayerStatus: (status: PlayerStatus) => void;
   setVisualizerFrame: (frame: VisualizerFrame) => void;
   setVisualizerMode: (mode: VisualizerMode) => void;
@@ -45,6 +47,7 @@ export const useAppStore = create<AppStore>((set) => ({
   isLoadingTrack: false,
   setSongs: (songs) => set({ songs }),
   setSelectedSongId: (selectedSongId) => set({ selectedSongId }),
+  setPendingSongId: (pendingSongId) => set({ pendingSongId }),
   setPlayerStatus: (playerStatus) => set({ playerStatus }),
   setVisualizerFrame: (visualizerFrame) => set({ visualizerFrame }),
   setVisualizerMode: (visualizerMode) => set({ visualizerMode }),

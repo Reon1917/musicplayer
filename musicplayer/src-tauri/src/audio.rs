@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex, RwLock,
+    Arc, Condvar, Mutex, RwLock,
 };
 use std::thread;
 use std::time::Duration;
@@ -57,6 +57,31 @@ struct DecodedTrack {
 struct DecodedTrackCache {
     tracks: HashMap<String, DecodedTrack>,
     order: VecDeque<String>,
+    in_flight: HashMap<String, Arc<DecodeSlot>>,
+}
+
+struct DecodeSlot {
+    result: Mutex<Option<Result<DecodedTrack, String>>>,
+    ready: Condvar,
+}
+
+impl DecodeSlot {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<DecodedTrack, String> {
+        let mut result = self.result.lock().map_err(|err| err.to_string())?;
+        loop {
+            if let Some(result) = result.clone() {
+                return result;
+            }
+            result = self.ready.wait(result).map_err(|err| err.to_string())?;
+        }
+    }
 }
 
 impl DecodedTrackCache {
@@ -64,6 +89,7 @@ impl DecodedTrackCache {
         Self {
             tracks: HashMap::new(),
             order: VecDeque::new(),
+            in_flight: HashMap::new(),
         }
     }
 
@@ -75,6 +101,14 @@ impl DecodedTrackCache {
 
     fn contains(&self, key: &str) -> bool {
         self.tracks.contains_key(key)
+    }
+
+    fn in_flight(&self, key: &str) -> bool {
+        self.in_flight.contains_key(key)
+    }
+
+    fn insert_in_flight(&mut self, key: String, slot: Arc<DecodeSlot>) {
+        self.in_flight.insert(key, slot);
     }
 
     fn insert(&mut self, key: String, decoded: DecodedTrack) {
@@ -133,8 +167,8 @@ pub struct Player {
     output_sample_rate: Mutex<Option<u32>>,
     last_frame: Arc<Mutex<Option<VisualizerFrame>>>,
     visualizer_epoch: Arc<AtomicUsize>,
+    play_request_epoch: Arc<AtomicUsize>,
     decode_cache: Arc<Mutex<DecodedTrackCache>>,
-    decoding_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Player {
@@ -148,8 +182,8 @@ impl Player {
             output_sample_rate: Mutex::new(None),
             last_frame: Arc::new(Mutex::new(None)),
             visualizer_epoch: Arc::new(AtomicUsize::new(0)),
+            play_request_epoch: Arc::new(AtomicUsize::new(0)),
             decode_cache: Arc::new(Mutex::new(DecodedTrackCache::new())),
-            decoding_ids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -157,7 +191,12 @@ impl Player {
         self.ensure_stream()?;
         let output_rate = self.output_sample_rate()?;
         let cache_key = decoded_cache_key(&song.id, output_rate);
+        let request_epoch = self.play_request_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        self.playing.store(false, Ordering::Relaxed);
         let decoded = self.get_or_decode_song(&song, output_rate, &cache_key)?;
+        if self.play_request_epoch.load(Ordering::Relaxed) != request_epoch {
+            return Ok(self.status());
+        }
         let track = TrackAudio {
             song_id: song.id.clone(),
             title: song.title.clone().unwrap_or(song.file_name.clone()),
@@ -189,15 +228,16 @@ impl Player {
             return Ok(());
         }
 
+        let slot = Arc::new(DecodeSlot::new());
         {
-            let mut decoding_ids = self.decoding_ids.lock().map_err(|err| err.to_string())?;
-            if !decoding_ids.insert(cache_key.clone()) {
+            let mut cache = self.decode_cache.lock().map_err(|err| err.to_string())?;
+            if cache.contains(&cache_key) || cache.in_flight(&cache_key) {
                 return Ok(());
             }
+            cache.insert_in_flight(cache_key.clone(), Arc::clone(&slot));
         }
 
         let decode_cache = Arc::clone(&self.decode_cache);
-        let decoding_ids = Arc::clone(&self.decoding_ids);
         thread::spawn(move || {
             let decoded =
                 decode_audio_file(Path::new(&song.file_path), output_rate).map(|decoded| {
@@ -207,16 +247,7 @@ impl Player {
                         duration_seconds: decoded.duration_seconds,
                     }
                 });
-
-            if let Ok(decoded) = decoded {
-                if let Ok(mut cache) = decode_cache.lock() {
-                    cache.insert(cache_key.clone(), decoded);
-                }
-            }
-
-            if let Ok(mut decoding_ids) = decoding_ids.lock() {
-                decoding_ids.remove(&cache_key);
-            }
+            finish_decode(&decode_cache, &cache_key, &slot, decoded);
         });
 
         Ok(())
@@ -314,17 +345,33 @@ impl Player {
             return Ok(decoded);
         }
 
-        let decoded = decode_audio_file(Path::new(&song.file_path), output_rate)?;
-        let decoded = DecodedTrack {
-            samples: Arc::new(decoded.samples),
-            sample_rate: decoded.sample_rate,
-            duration_seconds: decoded.duration_seconds,
+        let slot = Arc::new(DecodeSlot::new());
+        let existing_slot = {
+            let mut cache = self.decode_cache.lock().map_err(|err| err.to_string())?;
+            if let Some(decoded) = cache.get(cache_key) {
+                return Ok(decoded);
+            }
+            if let Some(slot) = cache.in_flight.get(cache_key) {
+                Some(Arc::clone(slot))
+            } else {
+                cache.insert_in_flight(cache_key.to_string(), Arc::clone(&slot));
+                None
+            }
         };
-        self.decode_cache
-            .lock()
-            .map_err(|err| err.to_string())?
-            .insert(cache_key.to_string(), decoded.clone());
-        Ok(decoded)
+
+        if let Some(slot) = existing_slot {
+            return slot.wait();
+        }
+
+        let decoded = decode_audio_file(Path::new(&song.file_path), output_rate).map(|decoded| {
+            DecodedTrack {
+                samples: Arc::new(decoded.samples),
+                sample_rate: decoded.sample_rate,
+                duration_seconds: decoded.duration_seconds,
+            }
+        });
+        finish_decode(&self.decode_cache, cache_key, &slot, decoded.clone());
+        decoded
     }
 
     fn ensure_stream(&self) -> Result<(), String> {
@@ -502,6 +549,25 @@ struct DecodedAudio {
 
 fn decoded_cache_key(song_id: &str, output_rate: u32) -> String {
     format!("{song_id}:{output_rate}")
+}
+
+fn finish_decode(
+    decode_cache: &Arc<Mutex<DecodedTrackCache>>,
+    cache_key: &str,
+    slot: &Arc<DecodeSlot>,
+    decoded: Result<DecodedTrack, String>,
+) {
+    if let Ok(mut result) = slot.result.lock() {
+        *result = Some(decoded.clone());
+        slot.ready.notify_all();
+    }
+
+    if let Ok(mut cache) = decode_cache.lock() {
+        cache.in_flight.remove(cache_key);
+        if let Ok(decoded) = decoded {
+            cache.insert(cache_key.to_string(), decoded);
+        }
+    }
 }
 
 fn decode_audio_file(path: &Path, output_sample_rate: u32) -> Result<DecodedAudio, String> {

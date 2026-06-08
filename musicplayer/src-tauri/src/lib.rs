@@ -91,19 +91,24 @@ fn update_song_metadata(
 }
 
 #[tauri::command]
-fn play_song(
+async fn play_song(
     song_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PlayerStatus, String> {
-    let song = state
-        .db
-        .lock()
-        .map_err(|err| err.to_string())?
-        .get_song(&song_id)?
-        .ok_or_else(|| "Song not found".to_string())?;
+    let db = Arc::clone(&state.db);
+    let player = Arc::clone(&state.player);
+    tauri::async_runtime::spawn_blocking(move || {
+        let song = db
+            .lock()
+            .map_err(|err| err.to_string())?
+            .get_song(&song_id)?
+            .ok_or_else(|| "Song not found".to_string())?;
 
-    state.player.play_song(song, app)
+        player.play_song(song, app)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
