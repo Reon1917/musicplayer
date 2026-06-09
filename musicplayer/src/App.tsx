@@ -10,9 +10,12 @@ import {
   PencilLine,
   Play,
   RefreshCw,
+  Repeat,
+  Repeat1,
   Save,
   Search,
   Settings,
+  Shuffle,
   SkipBack,
   SkipForward,
   Square,
@@ -58,6 +61,8 @@ type MetadataDraft = {
   coverArtPath: string | null;
 };
 
+type RepeatMode = "all" | "one";
+
 function App() {
   const {
     songs,
@@ -87,10 +92,18 @@ function App() {
   const [metadataDraft, setMetadataDraft] = useState<MetadataDraft>(() => createMetadataDraft());
   const [metadataStatus, setMetadataStatus] = useState<string | undefined>();
   const [isSavingMetadata, setIsSavingMetadata] = useState(false);
+  const [repeatMode, setRepeatMode] = useState<RepeatMode>("all");
+  const [isShuffleEnabled, setIsShuffleEnabled] = useState(false);
   const preloadQueueRef = useRef<Set<string>>(new Set());
   const playRequestRef = useRef(0);
   const lastStoreUpdateRef = useRef(0);
   const canvasFrameRef = useRef<VisualizerFrame | undefined>(undefined);
+  const lastPlaybackRef = useRef<{ songId?: string | null; wasPlaying: boolean }>({
+    songId: undefined,
+    wasPlaying: false,
+  });
+  const handledCompletionRef = useRef<string | undefined>(undefined);
+  const suppressAutoAdvanceRef = useRef(false);
 
   const selectedSong = useMemo(
     () => songs.find((song) => song.id === selectedSongId) ?? songs[0],
@@ -141,6 +154,19 @@ function App() {
       void unlisten.then((dispose) => dispose());
     };
   }, [setPlayerStatus, setScanError, setSongs, setVisualizerFrame]);
+
+  useEffect(() => {
+    if (!isTauriRuntime) return;
+    const interval = window.setInterval(() => {
+      invoke<PlayerStatus>("get_player_status")
+        .then(setPlayerStatus)
+        .catch(() => {
+          // The visualizer event loop will continue to update status when available.
+        });
+    }, 650);
+
+    return () => window.clearInterval(interval);
+  }, [setPlayerStatus]);
 
   useEffect(() => {
     if (!selectedSong) return;
@@ -295,6 +321,8 @@ function App() {
     setPendingSongId(song.id);
     setIsLoadingTrack(true);
     setScanError(undefined);
+    suppressAutoAdvanceRef.current = false;
+    handledCompletionRef.current = undefined;
     try {
       const status = await invoke<PlayerStatus>("play_song", { songId: song.id });
       if (playRequestRef.current !== requestId) return;
@@ -328,7 +356,11 @@ function App() {
 
   async function pauseOrResume() {
     if (!isTauriRuntime) return;
+    suppressAutoAdvanceRef.current = playerStatus.isPlaying;
     const status = await invoke<PlayerStatus>(playerStatus.isPlaying ? "pause_song" : "resume_song");
+    if (status.isPlaying) {
+      suppressAutoAdvanceRef.current = false;
+    }
     setPlayerStatus(status);
   }
 
@@ -348,6 +380,7 @@ function App() {
 
   async function stop() {
     if (!isTauriRuntime) return;
+    suppressAutoAdvanceRef.current = true;
     const status = await invoke<PlayerStatus>("stop_song");
     setPlayerStatus(status);
   }
@@ -371,15 +404,72 @@ function App() {
   }
 
   function nextSong(offset: number) {
-    if (songs.length === 0) return;
-    const currentIndex = Math.max(
-      0,
-      songs.findIndex((song) => song.id === (playerStatus.songId ?? selectedSongId)),
-    );
-    const next = songs[(currentIndex + offset + songs.length) % songs.length];
+    const next = pickNextSong(playerStatus.songId ?? selectedSongId, offset, isShuffleEnabled);
+    if (!next) return;
     preloadSong(next.id);
     void play(next);
   }
+
+  function pickNextSong(currentSongId: string | null | undefined, offset: number, shuffle: boolean) {
+    if (songs.length === 0) return undefined;
+
+    if (shuffle && songs.length > 1) {
+      const candidates = songs.filter((song) => song.id !== currentSongId);
+      return candidates[Math.floor(Math.random() * candidates.length)] ?? songs[0];
+    }
+
+    const currentIndex = Math.max(
+      0,
+      songs.findIndex((song) => song.id === currentSongId),
+    );
+    return songs[(currentIndex + offset + songs.length) % songs.length];
+  }
+
+  function toggleRepeatMode() {
+    setRepeatMode((mode) => (mode === "all" ? "one" : "all"));
+  }
+
+  useEffect(() => {
+    const previous = lastPlaybackRef.current;
+    const wasPlayingThisSong =
+      previous.wasPlaying && previous.songId != null && previous.songId === playerStatus.songId;
+    const isAtEnd =
+      playerStatus.songId != null &&
+      playerStatus.durationSeconds > 0 &&
+      playerStatus.positionSeconds >= Math.max(0, playerStatus.durationSeconds - 0.2);
+    const isCompleted =
+      wasPlayingThisSong &&
+      !playerStatus.isPlaying &&
+      isAtEnd &&
+      !isLoadingTrack &&
+      !suppressAutoAdvanceRef.current;
+
+    lastPlaybackRef.current = {
+      songId: playerStatus.songId,
+      wasPlaying: playerStatus.isPlaying,
+    };
+
+    if (!isCompleted) {
+      if (playerStatus.isPlaying) {
+        handledCompletionRef.current = undefined;
+        suppressAutoAdvanceRef.current = false;
+      }
+      return;
+    }
+
+    const completionKey = `${playerStatus.songId}:${Math.round(playerStatus.durationSeconds * 10)}`;
+    if (handledCompletionRef.current === completionKey) return;
+    handledCompletionRef.current = completionKey;
+
+    const completedSong = songs.find((song) => song.id === playerStatus.songId);
+    const next = repeatMode === "one"
+      ? completedSong
+      : pickNextSong(playerStatus.songId, 1, isShuffleEnabled);
+    if (next) {
+      preloadSong(next.id);
+      void play(next);
+    }
+  }, [isLoadingTrack, isShuffleEnabled, playerStatus, repeatMode, songs]);
 
   return (
     <main className={clsx("app-shell", `theme-${theme}`)}>
@@ -394,7 +484,13 @@ function App() {
               text={playerStatus.title ?? nowPlayingSong?.title ?? displaySong?.title ?? displaySong?.fileName ?? "No song loaded"}
             />
           </div>
-          <button className="icon-button" type="button" onClick={() => setIsSettingsOpen(true)}>
+          <button
+            className="icon-button"
+            type="button"
+            title="Settings"
+            aria-label="Open settings"
+            onClick={() => setIsSettingsOpen(true)}
+          >
             <Settings size={15} />
           </button>
         </header>
@@ -413,11 +509,15 @@ function App() {
             <TransportPanel
               canPlay={songs.length > 0}
               isLoadingTrack={isLoadingTrack}
+              isShuffleEnabled={isShuffleEnabled}
+              repeatMode={repeatMode}
               status={playerStatus}
               onPrimary={() => void primaryTransportAction()}
               onStop={() => void stop()}
               onPrevious={() => nextSong(-1)}
               onNext={() => nextSong(1)}
+              onToggleShuffle={() => setIsShuffleEnabled((enabled) => !enabled)}
+              onToggleRepeat={toggleRepeatMode}
               onVolume={setVolume}
               onSeek={seek}
             />
@@ -546,9 +646,15 @@ function CoverPanel({
           className="song-meta-line"
           text={`${song?.genre ?? "Unknown Genre"}${song?.year ? ` / ${song.year}` : ""}`}
         />
-        <button className="utility-button edit-metadata-button" type="button" disabled={!song} onClick={onEdit}>
-          <PencilLine size={14} />
-          Edit Metadata
+        <button
+          className="utility-button edit-metadata-button"
+          type="button"
+          title="Edit metadata"
+          aria-label="Edit metadata"
+          disabled={!song}
+          onClick={onEdit}
+        >
+          <PencilLine size={15} strokeWidth={2.4} />
         </button>
       </div>
     </section>
@@ -721,21 +827,29 @@ function getVisualizerLabel(mode: VisualizerMode) {
 function TransportPanel({
   canPlay,
   isLoadingTrack,
+  isShuffleEnabled,
+  repeatMode,
   status,
   onPrimary,
   onStop,
   onPrevious,
   onNext,
+  onToggleShuffle,
+  onToggleRepeat,
   onVolume,
   onSeek,
 }: {
   canPlay: boolean;
   isLoadingTrack: boolean;
+  isShuffleEnabled: boolean;
+  repeatMode: RepeatMode;
   status: PlayerStatus;
   onPrimary: () => void;
   onStop: () => void;
   onPrevious: () => void;
   onNext: () => void;
+  onToggleShuffle: () => void;
+  onToggleRepeat: () => void;
   onVolume: (volume: number) => void;
   onSeek: (positionSeconds: number) => void;
 }) {
@@ -781,6 +895,17 @@ function TransportPanel({
         onPointerUp={(event) => commitSeek(Number(event.currentTarget.value))}
       />
       <div className="button-row">
+        <button
+          className={clsx("control-button mode-toggle", isShuffleEnabled && "active")}
+          type="button"
+          title={isShuffleEnabled ? "Shuffle on" : "Shuffle off"}
+          aria-label={isShuffleEnabled ? "Turn shuffle off" : "Turn shuffle on"}
+          aria-pressed={isShuffleEnabled}
+          disabled={!canPlay}
+          onClick={onToggleShuffle}
+        >
+          <Shuffle size={15} />
+        </button>
         <button className="control-button" type="button" disabled={!canPlay} onClick={onPrevious}>
           <SkipBack size={16} />
         </button>
@@ -792,6 +917,17 @@ function TransportPanel({
         </button>
         <button className="control-button" type="button" disabled={!canPlay} onClick={onNext}>
           <SkipForward size={16} />
+        </button>
+        <button
+          className={clsx("control-button mode-toggle active", repeatMode === "one" && "repeat-one")}
+          type="button"
+          title={repeatMode === "one" ? "Repeat one" : "Repeat all"}
+          aria-label={repeatMode === "one" ? "Switch to repeat all" : "Switch to repeat one"}
+          aria-pressed
+          disabled={!canPlay}
+          onClick={onToggleRepeat}
+        >
+          {repeatMode === "one" ? <Repeat1 size={15} /> : <Repeat size={15} />}
         </button>
       </div>
       <label className="volume-row">
@@ -2161,8 +2297,10 @@ function SongTable({
             <span className="row-index">
               {isPending ? "..." : isPlaying ? ">" : String(index + 1).padStart(2, "0")}
             </span>
-            <strong>{song.title ?? song.fileName}</strong>
-            <em>{song.artist ?? "Unknown Artist"}</em>
+            <span className="song-main">
+              <strong>{song.title ?? song.fileName}</strong>
+              <em>{song.artist ?? "Unknown Artist"}</em>
+            </span>
             <small>{isPending ? "Loading" : formatTime(song.durationSeconds ?? 0)}</small>
           </button>
         );
