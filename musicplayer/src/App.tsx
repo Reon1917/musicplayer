@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MutableRefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -48,6 +48,13 @@ const visualizers: Array<{ id: VisualizerMode; label: string }> = [
   { id: "waveform", label: "Oscilloscope" },
 ];
 
+const VISUALIZER_RENDER_FPS = 60;
+const VISUALIZER_RENDER_INTERVAL_MS = 1000 / VISUALIZER_RENDER_FPS;
+const VISUALIZER_MAX_DEVICE_PIXEL_RATIO = 1.5;
+const VISUALIZER_STORE_INTERVAL_MS = 100;
+const PLAYER_STATUS_RENDER_INTERVAL_MS = 250;
+const SIDE_METER_SEGMENTS = Array.from({ length: 12 }, (_, index) => index);
+
 const activeVisualizerIds = visualizers.map((item) => item.id);
 
 const isTauriRuntime =
@@ -64,28 +71,25 @@ type MetadataDraft = {
 type RepeatMode = "all" | "one";
 
 function App() {
-  const {
-    songs,
-    selectedSongId,
-    pendingSongId,
-    playerStatus,
-    visualizerFrame,
-    visualizerMode,
-    theme,
-    scanError,
-    isScanning,
-    isLoadingTrack,
-    setSongs,
-    setSelectedSongId,
-    setPendingSongId,
-    setPlayerStatus,
-    setVisualizerFrame,
-    setVisualizerMode,
-    setTheme,
-    setScanError,
-    setIsScanning,
-    setIsLoadingTrack,
-  } = useAppStore();
+  const songs = useAppStore((state) => state.songs);
+  const selectedSongId = useAppStore((state) => state.selectedSongId);
+  const pendingSongId = useAppStore((state) => state.pendingSongId);
+  const playerStatus = useAppStore((state) => state.playerStatus);
+  const visualizerMode = useAppStore((state) => state.visualizerMode);
+  const theme = useAppStore((state) => state.theme);
+  const scanError = useAppStore((state) => state.scanError);
+  const isScanning = useAppStore((state) => state.isScanning);
+  const isLoadingTrack = useAppStore((state) => state.isLoadingTrack);
+  const setSongs = useAppStore((state) => state.setSongs);
+  const setSelectedSongId = useAppStore((state) => state.setSelectedSongId);
+  const setPendingSongId = useAppStore((state) => state.setPendingSongId);
+  const setPlayerStatus = useAppStore((state) => state.setPlayerStatus);
+  const setVisualizerFrame = useAppStore((state) => state.setVisualizerFrame);
+  const setVisualizerMode = useAppStore((state) => state.setVisualizerMode);
+  const setTheme = useAppStore((state) => state.setTheme);
+  const setScanError = useAppStore((state) => state.setScanError);
+  const setIsScanning = useAppStore((state) => state.setIsScanning);
+  const setIsLoadingTrack = useAppStore((state) => state.setIsLoadingTrack);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isMetadataEditorOpen, setIsMetadataEditorOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -96,7 +100,8 @@ function App() {
   const [isShuffleEnabled, setIsShuffleEnabled] = useState(false);
   const preloadQueueRef = useRef<Set<string>>(new Set());
   const playRequestRef = useRef(0);
-  const lastStoreUpdateRef = useRef(0);
+  const lastVisualizerStoreUpdateRef = useRef(0);
+  const lastStatusRenderUpdateRef = useRef(0);
   const canvasFrameRef = useRef<VisualizerFrame | undefined>(undefined);
   const lastPlaybackRef = useRef<{ songId?: string | null; wasPlaying: boolean }>({
     songId: undefined,
@@ -124,6 +129,67 @@ function App() {
     );
   }, [searchQuery, songs]);
 
+  const preloadSong = useCallback((songId: string) => {
+    if (!isTauriRuntime || preloadQueueRef.current.has(songId)) return;
+    preloadQueueRef.current.add(songId);
+    invoke("preload_song", { songId })
+      .catch((error) => console.warn("song preload failed", error))
+      .finally(() => preloadQueueRef.current.delete(songId));
+  }, []);
+
+  const play = useCallback(async (song: Song | undefined = selectedSong) => {
+    if (!isTauriRuntime) {
+      setScanError("Playback uses the Tauri/Rust backend. Start the desktop app with `pnpm run desktop`.");
+      return;
+    }
+    if (!song) return;
+    const requestId = playRequestRef.current + 1;
+    playRequestRef.current = requestId;
+    setSelectedSongId(song.id);
+    setPendingSongId(song.id);
+    setIsLoadingTrack(true);
+    setScanError(undefined);
+    suppressAutoAdvanceRef.current = false;
+    handledCompletionRef.current = undefined;
+    try {
+      const status = await invoke<PlayerStatus>("play_song", { songId: song.id });
+      if (playRequestRef.current !== requestId) return;
+      setPlayerStatus(status);
+    } catch (error) {
+      if (playRequestRef.current !== requestId) return;
+      setScanError(String(error));
+      try {
+        const status = await invoke<PlayerStatus>("get_player_status");
+        if (playRequestRef.current === requestId) {
+          setPlayerStatus(status);
+        }
+      } catch {
+        // Keep the original playback error visible.
+      }
+    } finally {
+      if (playRequestRef.current === requestId) {
+        setPendingSongId(undefined);
+        setIsLoadingTrack(false);
+      }
+    }
+  }, [
+    selectedSong,
+    setIsLoadingTrack,
+    setPendingSongId,
+    setPlayerStatus,
+    setScanError,
+    setSelectedSongId,
+  ]);
+
+  const handleSongSelect = useCallback((songId: string) => {
+    setSelectedSongId(songId);
+    preloadSong(songId);
+  }, [preloadSong, setSelectedSongId]);
+
+  const handleSongPlay = useCallback((song: Song) => {
+    void play(song);
+  }, [play]);
+
   useEffect(() => {
     if (!isTauriRuntime) {
       setScanError("Run `pnpm run desktop` to use folder import and playback in the macOS desktop app.");
@@ -141,13 +207,17 @@ function App() {
     const unlisten = listen<VisualizerFrame>("visualizer-frame", (event) => {
       canvasFrameRef.current = event.payload;
       const now = performance.now();
-      if (now - lastStoreUpdateRef.current < 100) return;
-      lastStoreUpdateRef.current = now;
-      setVisualizerFrame(event.payload);
-      setPlayerStatus({
-        ...useAppStore.getState().playerStatus,
-        positionSeconds: event.payload.timestamp,
-      });
+      if (now - lastVisualizerStoreUpdateRef.current >= VISUALIZER_STORE_INTERVAL_MS) {
+        lastVisualizerStoreUpdateRef.current = now;
+        setVisualizerFrame(event.payload);
+      }
+      if (now - lastStatusRenderUpdateRef.current >= PLAYER_STATUS_RENDER_INTERVAL_MS) {
+        lastStatusRenderUpdateRef.current = now;
+        setPlayerStatus({
+          ...useAppStore.getState().playerStatus,
+          positionSeconds: event.payload.timestamp,
+        });
+      }
     });
 
     return () => {
@@ -156,27 +226,28 @@ function App() {
   }, [setPlayerStatus, setScanError, setSongs, setVisualizerFrame]);
 
   useEffect(() => {
-    if (!isTauriRuntime) return;
+    if (!isTauriRuntime || !playerStatus.songId) return;
+    const intervalMs = playerStatus.isPlaying ? 750 : 1500;
     const interval = window.setInterval(() => {
       invoke<PlayerStatus>("get_player_status")
         .then(setPlayerStatus)
         .catch(() => {
           // The visualizer event loop will continue to update status when available.
         });
-    }, 650);
+    }, intervalMs);
 
     return () => window.clearInterval(interval);
-  }, [setPlayerStatus]);
+  }, [playerStatus.isPlaying, playerStatus.songId, setPlayerStatus]);
 
   useEffect(() => {
     if (!selectedSong) return;
     preloadSong(selectedSong.id);
-  }, [selectedSong?.id]);
+  }, [preloadSong, selectedSong?.id]);
 
   useEffect(() => {
     if (songs.length === 0) return;
     preloadSong(songs[0].id);
-  }, [songs]);
+  }, [preloadSong, songs]);
 
   useEffect(() => {
     setMetadataDraft(createMetadataDraft(selectedSong));
@@ -307,51 +378,6 @@ function App() {
     } finally {
       setIsSavingMetadata(false);
     }
-  }
-
-  async function play(song: Song | undefined = selectedSong) {
-    if (!isTauriRuntime) {
-      setScanError("Playback uses the Tauri/Rust backend. Start the desktop app with `pnpm run desktop`.");
-      return;
-    }
-    if (!song) return;
-    const requestId = playRequestRef.current + 1;
-    playRequestRef.current = requestId;
-    setSelectedSongId(song.id);
-    setPendingSongId(song.id);
-    setIsLoadingTrack(true);
-    setScanError(undefined);
-    suppressAutoAdvanceRef.current = false;
-    handledCompletionRef.current = undefined;
-    try {
-      const status = await invoke<PlayerStatus>("play_song", { songId: song.id });
-      if (playRequestRef.current !== requestId) return;
-      setPlayerStatus(status);
-    } catch (error) {
-      if (playRequestRef.current !== requestId) return;
-      setScanError(String(error));
-      try {
-        const status = await invoke<PlayerStatus>("get_player_status");
-        if (playRequestRef.current === requestId) {
-          setPlayerStatus(status);
-        }
-      } catch {
-        // Keep the original playback error visible.
-      }
-    } finally {
-      if (playRequestRef.current === requestId) {
-        setPendingSongId(undefined);
-        setIsLoadingTrack(false);
-      }
-    }
-  }
-
-  function preloadSong(songId: string) {
-    if (!isTauriRuntime || preloadQueueRef.current.has(songId)) return;
-    preloadQueueRef.current.add(songId);
-    invoke("preload_song", { songId })
-      .catch((error) => console.warn("song preload failed", error))
-      .finally(() => preloadQueueRef.current.delete(songId));
   }
 
   async function pauseOrResume() {
@@ -523,25 +549,11 @@ function App() {
             />
           </aside>
 
-          <section className={clsx("visualizer-rack", `visual-mode-${visualizerMode}`)}>
-            <VisualizerCanvas
-              frame={visualizerFrame}
-              frameRef={canvasFrameRef}
-              mode={visualizerMode}
-              theme={theme}
-            />
-            <SideMeter frame={visualizerFrame} side="left" />
-            <SideMeter frame={visualizerFrame} side="right" />
-            <div className="visualizer-label">
-              {getVisualizerLabel(visualizerMode)}
-            </div>
-            <div className="meter-row">
-              <Meter label="Bass" value={visualizerFrame?.bass ?? 0} />
-              <Meter label="Pulse" value={visualizerFrame?.bassPulse ?? 0} />
-              <Meter label="Vocal" value={visualizerFrame?.mids ?? 0} />
-              <Meter label="Treble" value={visualizerFrame?.treble ?? 0} />
-            </div>
-          </section>
+          <VisualizerRack
+            frameRef={canvasFrameRef}
+            mode={visualizerMode}
+            theme={theme}
+          />
         </div>
 
         <section className="library-panel">
@@ -578,12 +590,9 @@ function App() {
             selectedSongId={selectedSongId}
             playingSongId={playerStatus.songId}
             pendingSongId={pendingSongId}
-            onSelect={(songId) => {
-              setSelectedSongId(songId);
-              preloadSong(songId);
-            }}
+            onSelect={handleSongSelect}
             onPreload={preloadSong}
-            onPlay={(song) => void play(song)}
+            onPlay={handleSongPlay}
           />
         </section>
       </section>
@@ -758,6 +767,39 @@ function MetadataEditor({
   );
 }
 
+const VisualizerRack = memo(function VisualizerRack({
+  frameRef,
+  mode,
+  theme,
+}: {
+  frameRef: MutableRefObject<VisualizerFrame | undefined>;
+  mode: VisualizerMode;
+  theme: AppTheme;
+}) {
+  const frame = useAppStore((state) => state.visualizerFrame);
+
+  return (
+    <section className={clsx("visualizer-rack", `visual-mode-${mode}`)}>
+      <VisualizerCanvas
+        frameRef={frameRef}
+        mode={mode}
+        theme={theme}
+      />
+      <SideMeter frame={frame} side="left" />
+      <SideMeter frame={frame} side="right" />
+      <div className="visualizer-label">
+        {getVisualizerLabel(mode)}
+      </div>
+      <div className="meter-row">
+        <Meter label="Bass" value={frame?.bass ?? 0} />
+        <Meter label="Pulse" value={frame?.bassPulse ?? 0} />
+        <Meter label="Vocal" value={frame?.mids ?? 0} />
+        <Meter label="Treble" value={frame?.treble ?? 0} />
+      </div>
+    </section>
+  );
+});
+
 function SideMeter({
   frame,
   side,
@@ -774,7 +816,7 @@ function SideMeter({
 
   return (
     <div className={clsx("side-meter", `side-meter-${side}`)} aria-hidden="true">
-      {Array.from({ length: 12 }).map((_, index) => {
+      {SIDE_METER_SEGMENTS.map((index) => {
         const fromBottom = 11 - index;
         const threshold = fromBottom / 12;
         const meterFill = Math.max(0, Math.min(1, (signal - threshold * 0.84) / 0.22));
@@ -946,18 +988,23 @@ function TransportPanel({
   );
 }
 
-function VisualizerCanvas({
-  frame: _frame,
+const VisualizerCanvas = memo(function VisualizerCanvas({
   frameRef,
   mode,
   theme,
 }: {
-  frame?: VisualizerFrame;
-  frameRef: React.MutableRefObject<VisualizerFrame | undefined>;
+  frameRef: MutableRefObject<VisualizerFrame | undefined>;
   mode: VisualizerMode;
   theme: AppTheme;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasSizeRef = useRef({
+    width: 0,
+    height: 0,
+    deviceWidth: 0,
+    deviceHeight: 0,
+    scale: 1,
+  });
   const renderStateRef = useRef<VisualizerRenderState>({
     smoothedBars: [],
     peakBars: [],
@@ -970,6 +1017,8 @@ function VisualizerCanvas({
     analyzerFloor: 0.02,
     phase: 0,
     lastTime: 0,
+    lastRenderWallTime: 0,
+    interpolatedFrame: createEmptyVisualizerFrame(),
     nextFrameArrival: 0,
     lastRenderedTimestamp: -1,
   });
@@ -977,7 +1026,7 @@ function VisualizerCanvas({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const context = canvas.getContext("2d");
+    const context = canvas.getContext("2d", { alpha: false });
     if (!context) return;
     const activeCanvas = canvas;
     const activeContext = context;
@@ -985,12 +1034,34 @@ function VisualizerCanvas({
     let animationFrame = 0;
     let lastDeviceWidth = 0;
     let lastDeviceHeight = 0;
+    const syncCanvasSize = () => {
+      const rect = activeCanvas.getBoundingClientRect();
+      const scale = Math.min(window.devicePixelRatio || 1, VISUALIZER_MAX_DEVICE_PIXEL_RATIO);
+      const width = Math.max(1, Math.round(rect.width));
+      const height = Math.max(1, Math.round(rect.height));
+      canvasSizeRef.current = {
+        width,
+        height,
+        deviceWidth: Math.max(1, Math.round(width * scale)),
+        deviceHeight: Math.max(1, Math.round(height * scale)),
+        scale,
+      };
+    };
+
+    syncCanvasSize();
+    const resizeObserver = typeof ResizeObserver === "undefined"
+      ? undefined
+      : new ResizeObserver(syncCanvasSize);
+    resizeObserver?.observe(activeCanvas);
+    window.addEventListener("resize", syncCanvasSize);
 
     function render(now: number) {
-      const rect = activeCanvas.getBoundingClientRect();
-      const scale = window.devicePixelRatio || 1;
-      const deviceWidth = Math.max(1, Math.floor(rect.width * scale));
-      const deviceHeight = Math.max(1, Math.floor(rect.height * scale));
+      if (document.visibilityState === "hidden") {
+        animationFrame = window.requestAnimationFrame(render);
+        return;
+      }
+
+      const { width, height, deviceWidth, deviceHeight, scale } = canvasSizeRef.current;
       const needsResize = deviceWidth !== lastDeviceWidth || deviceHeight !== lastDeviceHeight;
       if (needsResize) {
         activeCanvas.width = deviceWidth;
@@ -1001,6 +1072,14 @@ function VisualizerCanvas({
 
       const state = renderStateRef.current;
       const incoming = frameRef.current;
+      if (
+        !needsResize &&
+        state.lastRenderWallTime > 0 &&
+        now - state.lastRenderWallTime < VISUALIZER_RENDER_INTERVAL_MS
+      ) {
+        animationFrame = window.requestAnimationFrame(render);
+        return;
+      }
 
       if (incoming && incoming.timestamp !== state.nextFrame?.timestamp) {
         const gap = state.nextFrame ? Math.abs(incoming.timestamp - state.nextFrame.timestamp) : 0;
@@ -1013,7 +1092,12 @@ function VisualizerCanvas({
       if (state.prevFrame && state.nextFrame) {
         const frameIntervalMs = (state.nextFrame.timestamp - state.prevFrame.timestamp) * 1000;
         const t = Math.min(1, (now - state.nextFrameArrival) / Math.max(frameIntervalMs, 16));
-        displayFrame = interpolateFrame(state.prevFrame, state.nextFrame, t);
+        displayFrame = interpolateFrameInto(
+          state.interpolatedFrame,
+          state.prevFrame,
+          state.nextFrame,
+          t,
+        );
       } else {
         displayFrame = state.nextFrame ?? state.prevFrame;
       }
@@ -1028,12 +1112,13 @@ function VisualizerCanvas({
         return;
       }
       state.lastRenderedTimestamp = displayTimestamp;
+      state.lastRenderWallTime = now;
 
       activeContext.setTransform(scale, 0, 0, scale, 0, 0);
       drawVisualizer(
         activeContext,
-        rect.width,
-        rect.height,
+        width,
+        height,
         displayFrame,
         mode,
         theme,
@@ -1044,11 +1129,15 @@ function VisualizerCanvas({
     }
 
     animationFrame = window.requestAnimationFrame(render);
-    return () => window.cancelAnimationFrame(animationFrame);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", syncCanvasSize);
+    };
   }, [mode, theme]);
 
   return <canvas className="visualizer-canvas" ref={canvasRef} />;
-}
+});
 
 type VisualizerRenderState = {
   smoothedBars: number[];
@@ -1062,6 +1151,8 @@ type VisualizerRenderState = {
   analyzerFloor: number;
   phase: number;
   lastTime: number;
+  lastRenderWallTime: number;
+  interpolatedFrame: VisualizerFrame;
   prevFrame?: VisualizerFrame;
   nextFrame?: VisualizerFrame;
   nextFrameArrival: number;
@@ -2182,22 +2273,51 @@ function lerp(from: number, to: number, amount: number) {
   return from + (to - from) * amount;
 }
 
-function interpolateFrame(prev: VisualizerFrame, next: VisualizerFrame, t: number): VisualizerFrame {
-  const ease = Math.min(1, Math.max(0, t));
+function createEmptyVisualizerFrame(): VisualizerFrame {
   return {
-    timestamp: lerp(prev.timestamp, next.timestamp, ease),
-    volume: lerp(prev.volume, next.volume, ease),
-    bassPulse: lerp(prev.bassPulse, next.bassPulse, ease),
-    bass: lerp(prev.bass, next.bass, ease),
-    mids: lerp(prev.mids, next.mids, ease),
-    treble: lerp(prev.treble, next.treble, ease),
-    leftLevel: lerp(prev.leftLevel, next.leftLevel, ease),
-    rightLevel: lerp(prev.rightLevel, next.rightLevel, ease),
-    frequencyBins: prev.frequencyBins.map((v, i) => lerp(v, next.frequencyBins[i] ?? v, ease)),
-    vocalBins: prev.vocalBins.map((v, i) => lerp(v, next.vocalBins[i] ?? v, ease)),
-    waveform: prev.waveform.map((v, i) => lerp(v, next.waveform[i] ?? v, ease)),
-    peaks: prev.peaks.map((v, i) => lerp(v, next.peaks[i] ?? v, ease)),
+    timestamp: 0,
+    volume: 0,
+    bassPulse: 0,
+    bass: 0,
+    mids: 0,
+    treble: 0,
+    leftLevel: 0,
+    rightLevel: 0,
+    frequencyBins: [],
+    vocalBins: [],
+    waveform: [],
+    peaks: [],
   };
+}
+
+function interpolateFrameInto(
+  target: VisualizerFrame,
+  prev: VisualizerFrame,
+  next: VisualizerFrame,
+  t: number,
+): VisualizerFrame {
+  const ease = Math.min(1, Math.max(0, t));
+  target.timestamp = lerp(prev.timestamp, next.timestamp, ease);
+  target.volume = lerp(prev.volume, next.volume, ease);
+  target.bassPulse = lerp(prev.bassPulse, next.bassPulse, ease);
+  target.bass = lerp(prev.bass, next.bass, ease);
+  target.mids = lerp(prev.mids, next.mids, ease);
+  target.treble = lerp(prev.treble, next.treble, ease);
+  target.leftLevel = lerp(prev.leftLevel, next.leftLevel, ease);
+  target.rightLevel = lerp(prev.rightLevel, next.rightLevel, ease);
+  interpolateArrayInto(target.frequencyBins, prev.frequencyBins, next.frequencyBins, ease);
+  interpolateArrayInto(target.vocalBins, prev.vocalBins, next.vocalBins, ease);
+  interpolateArrayInto(target.waveform, prev.waveform, next.waveform, ease);
+  interpolateArrayInto(target.peaks, prev.peaks, next.peaks, ease);
+  return target;
+}
+
+function interpolateArrayInto(target: number[], prev: number[], next: number[], ease: number) {
+  target.length = prev.length;
+  for (let index = 0; index < prev.length; index += 1) {
+    const value = prev[index];
+    target[index] = lerp(value, next[index] ?? value, ease);
+  }
 }
 
 function lerpColor(fromHex: string, toHex: string, amount: number) {
@@ -2243,7 +2363,7 @@ function Meter({ label, value }: { label: string; value: number }) {
   );
 }
 
-function SongTable({
+const SongTable = memo(function SongTable({
   songs,
   selectedSongId,
   playingSongId,
@@ -2307,7 +2427,7 @@ function SongTable({
       })}
     </div>
   );
-}
+});
 
 function SettingsModal({
   visualizerMode,

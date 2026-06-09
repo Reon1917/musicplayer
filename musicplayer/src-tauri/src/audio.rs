@@ -41,6 +41,7 @@ const STREAM_BUFFER_SECONDS: f32 = 3.0;
 const START_BUFFER_SECONDS: f32 = 0.35;
 const PRELOAD_SECONDS: f32 = 2.0;
 const WARM_CACHE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_WARM_PRELOADS: usize = 2;
 const MEDIA_BUFFER_LEN: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,13 +165,30 @@ impl PlaybackCore {
         self.space_available.notify_all();
     }
 
-    fn append_rolling(&self, left: f32, right: f32) {
+    fn append_rolling_samples(&self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+
         if let Ok(mut rolling) = self.rolling.lock() {
-            rolling.push_back(left);
-            rolling.push_back(right);
-            while rolling.len() > self.rolling_capacity_samples {
-                rolling.pop_front();
+            if samples.len() >= self.rolling_capacity_samples {
+                rolling.clear();
+                rolling.extend(
+                    samples[samples.len() - self.rolling_capacity_samples..]
+                        .iter()
+                        .copied(),
+                );
+                return;
             }
+
+            let overflow = rolling
+                .len()
+                .saturating_add(samples.len())
+                .saturating_sub(self.rolling_capacity_samples);
+            if overflow > 0 {
+                rolling.drain(..overflow);
+            }
+            rolling.extend(samples.iter().copied());
         }
     }
 
@@ -213,7 +231,10 @@ impl WarmTrackCache {
     }
 
     fn insert_in_flight(&mut self, key: String, cancel: Arc<AtomicBool>) -> bool {
-        if self.tracks.contains_key(&key) || self.in_flight.contains_key(&key) {
+        if self.tracks.contains_key(&key)
+            || self.in_flight.contains_key(&key)
+            || self.in_flight.len() >= MAX_WARM_PRELOADS
+        {
             return false;
         }
         self.in_flight.insert(key, cancel);
@@ -545,6 +566,7 @@ impl Player {
         let playing = Arc::clone(&self.playing);
         let volume_bits = Arc::clone(&self.volume_bits);
         let output_channels = config.channels as usize;
+        let mut visualizer_samples = Vec::with_capacity(FFT_SIZE * 2);
 
         device
             .build_output_stream(
@@ -557,6 +579,7 @@ impl Player {
                         &cursor,
                         &playing,
                         &volume_bits,
+                        &mut visualizer_samples,
                     );
                 },
                 err_fn,
@@ -639,25 +662,32 @@ fn write_output_data<T>(
     cursor: &Arc<AtomicUsize>,
     playing: &Arc<AtomicBool>,
     volume_bits: &Arc<AtomicU32>,
+    visualizer_samples: &mut Vec<f32>,
 ) where
     T: Sample + FromSample<f32>,
 {
     let core = current.lock().ok().and_then(|guard| guard.clone());
     let volume = f32::from_bits(volume_bits.load(Ordering::Relaxed));
     let mut ring = core.as_ref().and_then(|core| core.ring.lock().ok());
+    visualizer_samples.clear();
+    let required_capacity = output.len().min(FFT_SIZE * 2);
+    if visualizer_samples.capacity() < required_capacity {
+        visualizer_samples.reserve(required_capacity - visualizer_samples.capacity());
+    }
+    let mut consumed_any = false;
 
     for frame in output.chunks_mut(output_channels) {
         let mut left = 0.0;
         let mut right = 0.0;
-        let mut consumed = false;
 
         if playing.load(Ordering::Relaxed) {
             if let (Some(core), Some(ring)) = (core.as_ref(), ring.as_mut()) {
                 if ring.len() >= 2 {
                     left = ring.pop_front().unwrap_or(0.0) * volume;
                     right = ring.pop_front().unwrap_or(0.0) * volume;
-                    consumed = true;
-                    core.append_rolling(left, right);
+                    consumed_any = true;
+                    visualizer_samples.push(left);
+                    visualizer_samples.push(right);
                     cursor.fetch_add(1, Ordering::Relaxed);
                 } else if core.finished.load(Ordering::Relaxed) {
                     playing.store(false, Ordering::Relaxed);
@@ -673,11 +703,12 @@ fn write_output_data<T>(
             };
             *sample = T::from_sample(value.clamp(-1.0, 1.0));
         }
+    }
 
-        if consumed {
-            if let Some(core) = core.as_ref() {
-                core.space_available.notify_one();
-            }
+    if consumed_any {
+        if let Some(core) = core.as_ref() {
+            core.append_rolling_samples(visualizer_samples);
+            core.space_available.notify_one();
         }
     }
 }
