@@ -1,0 +1,20 @@
+:root {
+  --color-studio-bg: oklch(16% .008 210);
+  --color-studio-panel: oklch(19% .009 210);
+  --color-studio-raised: oklch(23% .009 210);
+  --color-studio-text: oklch(96% .004 180);
+  --color-studio-muted: oklch(69% .015 230);
+  --color-studio-accent: oklch(86% .105 166);
+  --color-studio-edge: oklch(30% .01 210);
+  --font-studio-display: "Avenir Next", "Avenir", sans-serif;
+  --font-studio-body: "Helvetica Neue", sans-serif;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --radius-studio: 12px;
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --ease-in: cubic-bezier(.7, 0, .84, 0);
+  --ease-in-out: cubic-bezier(.65, 0, .35, 1);
+  --dur-studio: 160ms;
+}

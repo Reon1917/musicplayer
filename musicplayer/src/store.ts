@@ -30,6 +30,16 @@ type AppStore = {
   setIsLoadingTrack: (isLoadingTrack: boolean) => void;
 };
 
+const themeIds: AppTheme[] = ["studio", "lapis", "phosphor", "amber", "ice"];
+const modeIds: VisualizerMode[] = ["aurora", "silk", "halo", "classicBars", "windowsScope", "waveform", "phosphorTrails", "freestyle", "ribbonDance", "starTunnel"];
+function readPreference<T extends string>(key: string, allowed: T[], fallback: T): T {
+  try { const value = localStorage.getItem(key); return allowed.includes(value as T) ? value as T : fallback; }
+  catch { return fallback; }
+}
+function savePreference(key: string, value: string) {
+  try { localStorage.setItem(key, value); } catch { /* Preferences remain available for this session. */ }
+}
+
 export const useAppStore = create<AppStore>((set) => ({
   songs: [],
   playerStatus: {
@@ -41,8 +51,8 @@ export const useAppStore = create<AppStore>((set) => ({
     durationSeconds: 0,
     volume: 0.8,
   },
-  visualizerMode: "classicBars",
-  theme: "lapis",
+  visualizerMode: readPreference("lapis.visualizer", modeIds, "aurora"),
+  theme: readPreference("lapis.theme", themeIds, "studio"),
   isScanning: false,
   isLoadingTrack: false,
   setSongs: (songs) => set({ songs }),
@@ -50,8 +60,16 @@ export const useAppStore = create<AppStore>((set) => ({
   setPendingSongId: (pendingSongId) => set({ pendingSongId }),
   setPlayerStatus: (playerStatus) => set({ playerStatus }),
   setVisualizerFrame: (visualizerFrame) => set({ visualizerFrame }),
-  setVisualizerMode: (visualizerMode) => set({ visualizerMode }),
-  setTheme: (theme) => set({ theme }),
+  setVisualizerMode: (visualizerMode) => { savePreference("lapis.visualizer", visualizerMode); set({ visualizerMode }); },
+  setTheme: (theme) => {
+    savePreference("lapis.theme", theme);
+    set((state) => {
+      const visualizerMode = theme === "studio" && !["aurora", "silk", "halo"].includes(state.visualizerMode)
+        ? "aurora" : theme !== "studio" && ["aurora", "silk", "halo"].includes(state.visualizerMode) ? "classicBars" : state.visualizerMode;
+      savePreference("lapis.visualizer", visualizerMode);
+      return { theme, visualizerMode };
+    });
+  },
   setScanError: (scanError) => set({ scanError }),
   setIsScanning: (isScanning) => set({ isScanning }),
   setIsLoadingTrack: (isLoadingTrack) => set({ isLoadingTrack }),

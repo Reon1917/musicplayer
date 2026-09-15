@@ -154,6 +154,11 @@ fn get_player_status(state: State<'_, AppState>) -> Result<PlayerStatus, String>
 }
 
 #[tauri::command]
+fn set_visualizer_visible(visible: bool, state: State<'_, AppState>) {
+    state.player.set_visualizer_visible(visible);
+}
+
+#[tauri::command]
 fn get_last_visualizer_frame(
     state: State<'_, AppState>,
 ) -> Result<Option<VisualizerFrame>, String> {
@@ -194,7 +199,8 @@ pub fn run() {
             seek_song,
             set_volume,
             get_player_status,
-            get_last_visualizer_frame
+            get_last_visualizer_frame,
+            set_visualizer_visible
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

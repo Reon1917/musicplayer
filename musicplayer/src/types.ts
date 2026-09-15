@@ -47,6 +47,9 @@ export type VisualizerFrame = {
 };
 
 export type VisualizerMode =
+  | "aurora"
+  | "silk"
+  | "halo"
   | "trapNation"
   | "wmpRibbons"
   | "plasmaStorm"
@@ -55,7 +58,11 @@ export type VisualizerMode =
   | "centerStereo"
   | "radial"
   | "windowsScope"
-  | "waveform";
+  | "waveform"
+  | "phosphorTrails"
+  | "freestyle"
+  | "ribbonDance"
+  | "starTunnel";
 export type SongMetadataInput = {
   title?: string | null;
   artist?: string | null;
@@ -68,4 +75,4 @@ export type SongMetadataInput = {
   coverArtPath?: string | null;
 };
 
-export type AppTheme = "lapis" | "phosphor" | "amber" | "ice";
+export type AppTheme = "studio" | "lapis" | "phosphor" | "amber" | "ice";

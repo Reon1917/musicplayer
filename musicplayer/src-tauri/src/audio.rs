@@ -192,11 +192,11 @@ impl PlaybackCore {
         }
     }
 
-    fn rolling_samples(&self) -> Vec<f32> {
-        self.rolling
-            .lock()
-            .map(|rolling| rolling.iter().copied().collect())
-            .unwrap_or_default()
+    fn copy_rolling_samples(&self, samples: &mut Vec<f32>) {
+        samples.clear();
+        if let Ok(rolling) = self.rolling.lock() {
+            samples.extend(rolling.iter().copied());
+        }
     }
 }
 
@@ -283,6 +283,7 @@ pub struct Player {
     output_sample_rate: Mutex<Option<u32>>,
     last_frame: Arc<Mutex<Option<VisualizerFrame>>>,
     visualizer_epoch: Arc<AtomicUsize>,
+    visualizer_visible: Arc<AtomicBool>,
     play_request_epoch: Arc<AtomicUsize>,
     warm_cache: Arc<Mutex<WarmTrackCache>>,
 }
@@ -298,6 +299,7 @@ impl Player {
             output_sample_rate: Mutex::new(None),
             last_frame: Arc::new(Mutex::new(None)),
             visualizer_epoch: Arc::new(AtomicUsize::new(0)),
+            visualizer_visible: Arc::new(AtomicBool::new(true)),
             play_request_epoch: Arc::new(AtomicUsize::new(0)),
             warm_cache: Arc::new(Mutex::new(WarmTrackCache::new())),
         }
@@ -495,6 +497,10 @@ impl Player {
         }
     }
 
+    pub fn set_visualizer_visible(&self, visible: bool) {
+        self.visualizer_visible.store(visible, Ordering::Relaxed);
+    }
+
     pub fn last_visualizer_frame(&self) -> Option<VisualizerFrame> {
         self.last_frame.lock().ok().and_then(|guard| guard.clone())
     }
@@ -594,6 +600,7 @@ impl Player {
         let playing = Arc::clone(&self.playing);
         let last_frame = Arc::clone(&self.last_frame);
         let visualizer_epoch = Arc::clone(&self.visualizer_epoch);
+        let visible = Arc::clone(&self.visualizer_visible);
 
         thread::spawn(move || {
             let mut peaks = vec![0.0; VISUALIZER_BINS];
@@ -606,6 +613,9 @@ impl Player {
             let fft = planner.plan_fft_forward(FFT_SIZE);
             let mut mono = vec![0.0; FFT_SIZE];
             let mut fft_buffer: Vec<Complex32> = Vec::with_capacity(FFT_SIZE);
+            let mut fft_scratch = vec![Complex32::default(); fft.get_inplace_scratch_len()];
+            let window = hann_window();
+            let mut samples = Vec::with_capacity(FFT_SIZE * 2);
 
             loop {
                 thread::sleep(Duration::from_millis(33));
@@ -627,9 +637,13 @@ impl Player {
                     None => break,
                 };
 
+                if !visible.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let frame_index = cursor.load(Ordering::Relaxed);
+                core.copy_rolling_samples(&mut samples);
                 let frame = build_visualizer_frame(
-                    &core.rolling_samples(),
+                    &samples,
                     core.sample_rate,
                     frame_index,
                     &mut smoothed_bins,
@@ -641,6 +655,8 @@ impl Player {
                     fft.as_ref(),
                     &mut mono,
                     &mut fft_buffer,
+                    &mut fft_scratch,
+                    &window,
                 );
                 if let Ok(mut guard) = last_frame.lock() {
                     *guard = Some(frame.clone());
@@ -670,11 +686,11 @@ fn write_output_data<T>(
     let volume = f32::from_bits(volume_bits.load(Ordering::Relaxed));
     let mut ring = core.as_ref().and_then(|core| core.ring.lock().ok());
     visualizer_samples.clear();
-    let required_capacity = output.len().min(FFT_SIZE * 2);
+    let required_capacity = output.len().div_ceil(output_channels) * 2;
     if visualizer_samples.capacity() < required_capacity {
-        visualizer_samples.reserve(required_capacity - visualizer_samples.capacity());
+        visualizer_samples.reserve(required_capacity);
     }
-    let mut consumed_any = false;
+    let mut consumed_frames = 0;
 
     for frame in output.chunks_mut(output_channels) {
         let mut left = 0.0;
@@ -685,10 +701,9 @@ fn write_output_data<T>(
                 if ring.len() >= 2 {
                     left = ring.pop_front().unwrap_or(0.0) * volume;
                     right = ring.pop_front().unwrap_or(0.0) * volume;
-                    consumed_any = true;
+                    consumed_frames += 1;
                     visualizer_samples.push(left);
                     visualizer_samples.push(right);
-                    cursor.fetch_add(1, Ordering::Relaxed);
                 } else if core.finished.load(Ordering::Relaxed) {
                     playing.store(false, Ordering::Relaxed);
                 }
@@ -705,7 +720,9 @@ fn write_output_data<T>(
         }
     }
 
-    if consumed_any {
+    drop(ring);
+    if consumed_frames > 0 {
+        cursor.fetch_add(consumed_frames, Ordering::Relaxed);
         if let Some(core) = core.as_ref() {
             core.append_rolling_samples(visualizer_samples);
             core.space_available.notify_one();
@@ -976,6 +993,12 @@ fn file_extension(path: &str) -> Option<String> {
         .map(|extension| extension.to_ascii_lowercase())
 }
 
+fn hann_window() -> Vec<f32> {
+    (0..FFT_SIZE)
+        .map(|index| 0.5 - 0.5 * ((2.0 * std::f32::consts::PI * index as f32) / FFT_SIZE as f32).cos())
+        .collect()
+}
+
 fn build_visualizer_frame(
     samples: &[f32],
     sample_rate: u32,
@@ -989,6 +1012,8 @@ fn build_visualizer_frame(
     fft: &dyn rustfft::Fft<f32>,
     mono: &mut Vec<f32>,
     fft_buffer: &mut Vec<Complex32>,
+    fft_scratch: &mut [Complex32],
+    window: &[f32],
 ) -> VisualizerFrame {
     let total_frames = samples.len() / 2;
     let start = total_frames.saturating_sub(FFT_SIZE);
@@ -1011,9 +1036,7 @@ fn build_visualizer_frame(
     let sample_count = (total_frames - start).max(1) as f32;
     let dc_offset = mono_sum / sample_count;
     for index in 0..(total_frames - start) {
-        let window =
-            0.5 - 0.5 * ((2.0 * std::f32::consts::PI * index as f32) / FFT_SIZE as f32).cos();
-        mono[index] = (mono[index] - dc_offset) * window;
+        mono[index] = (mono[index] - dc_offset) * window[index];
     }
 
     let step = (FFT_SIZE / 128).max(1);
@@ -1023,7 +1046,7 @@ fn build_visualizer_frame(
 
     fft_buffer.clear();
     fft_buffer.extend(mono.iter().map(|&sample| Complex32::new(sample, 0.0)));
-    fft.process(fft_buffer);
+    fft.process_with_scratch(fft_buffer, fft_scratch);
 
     let frequency_bins = build_log_frequency_bins(fft_buffer, sample_rate, smoothed_bins, peaks);
     let vocal_bins = build_vocal_bins(fft_buffer, sample_rate, smoothed_vocal_bins);
@@ -1204,3 +1227,7 @@ fn average_range_by_hz(
         total / count as f32
     }
 }
+
+#[cfg(test)]
+#[path = "audio_tests.rs"]
+mod tests;

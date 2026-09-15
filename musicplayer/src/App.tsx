@@ -25,6 +25,11 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import "./App.css";
+import { StudioShell } from "./StudioShell";
+import { createModernMotion, drawModernVisualizer, isModernMode, type ModernMotion } from "./modernVisualizers";
+import "./Studio.css";
+import { createRetroRenderer, isRetroMode } from "./retroVisualizers";
+import { drawRetroVisualizer } from "./retroFallback";
 import { useAppStore } from "./store";
 import type {
   AppTheme,
@@ -35,7 +40,10 @@ import type {
   VisualizerMode,
 } from "./types";
 
+const visualizerFrameListeners = new Set<() => void>();
+
 const themes: Array<{ id: AppTheme; label: string }> = [
+  { id: "studio", label: "Studio · Modern" },
   { id: "lapis", label: "Lapis Steel" },
   { id: "phosphor", label: "Phosphor" },
   { id: "amber", label: "Amber CRT" },
@@ -43,9 +51,16 @@ const themes: Array<{ id: AppTheme; label: string }> = [
 ];
 
 const visualizers: Array<{ id: VisualizerMode; label: string }> = [
+  { id: "aurora", label: "Aurora" },
+  { id: "silk", label: "Silk" },
+  { id: "halo", label: "Halo" },
   { id: "classicBars", label: "Winamp Bars" },
   { id: "windowsScope", label: "Old Windows" },
   { id: "waveform", label: "Oscilloscope" },
+  { id: "phosphorTrails", label: "Phosphor Trails" },
+  { id: "freestyle", label: "Alchemy Flow" },
+  { id: "ribbonDance", label: "Ambience" },
+  { id: "starTunnel", label: "Battery Spiral" },
 ];
 
 const VISUALIZER_RENDER_FPS = 60;
@@ -93,6 +108,24 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isMetadataEditorOpen, setIsMetadataEditorOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  useEffect(() => {
+    if (!isSettingsOpen && !isMetadataEditorOpen) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), [tabindex="0"]') ?? []);
+    focusable()[0]?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setIsSettingsOpen(false); setIsMetadataEditorOpen(false); }
+      if (event.key === "Tab") {
+        const elements = focusable();
+        const first = elements[0], last = elements[elements.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("keydown", onKey); if (previous?.isConnected) previous.focus(); };
+  }, [isSettingsOpen, isMetadataEditorOpen]);
   const [metadataDraft, setMetadataDraft] = useState<MetadataDraft>(() => createMetadataDraft());
   const [metadataStatus, setMetadataStatus] = useState<string | undefined>();
   const [isSavingMetadata, setIsSavingMetadata] = useState(false);
@@ -139,7 +172,7 @@ function App() {
 
   const play = useCallback(async (song: Song | undefined = selectedSong) => {
     if (!isTauriRuntime) {
-      setScanError("Playback uses the Tauri/Rust backend. Start the desktop app with `pnpm run desktop`.");
+      setScanError("Open the Lapis desktop app to play your music.");
       return;
     }
     if (!song) return;
@@ -192,7 +225,6 @@ function App() {
 
   useEffect(() => {
     if (!isTauriRuntime) {
-      setScanError("Run `pnpm run desktop` to use folder import and playback in the macOS desktop app.");
       return;
     }
 
@@ -204,8 +236,15 @@ function App() {
       .then(setPlayerStatus)
       .catch((error) => setScanError(String(error)));
 
+    const syncVisibility = () => {
+      void invoke("set_visualizer_visible", { visible: !document.hidden })
+        .catch((error) => console.warn("Visualizer visibility update failed", error));
+    };
+    syncVisibility();
+    document.addEventListener("visibilitychange", syncVisibility);
     const unlisten = listen<VisualizerFrame>("visualizer-frame", (event) => {
       canvasFrameRef.current = event.payload;
+      visualizerFrameListeners.forEach((wake) => wake());
       const now = performance.now();
       if (now - lastVisualizerStoreUpdateRef.current >= VISUALIZER_STORE_INTERVAL_MS) {
         lastVisualizerStoreUpdateRef.current = now;
@@ -221,6 +260,7 @@ function App() {
     });
 
     return () => {
+      document.removeEventListener("visibilitychange", syncVisibility);
       void unlisten.then((dispose) => dispose());
     };
   }, [setPlayerStatus, setScanError, setSongs, setVisualizerFrame]);
@@ -262,7 +302,7 @@ function App() {
 
   async function chooseFolder() {
     if (!isTauriRuntime) {
-      setScanError("This screen is running in a browser. Start the desktop app with `pnpm run desktop`.");
+      setScanError("Open the Lapis desktop app to import a music folder.");
       return;
     }
 
@@ -291,7 +331,7 @@ function App() {
 
   async function rescanFolder() {
     if (!isTauriRuntime) {
-      setScanError("Directory rescans use the Tauri/Rust backend. Start the desktop app with `pnpm run desktop`.");
+      setScanError("Open the Lapis desktop app to rescan your music folder.");
       return;
     }
 
@@ -497,9 +537,79 @@ function App() {
     }
   }, [isLoadingTrack, isShuffleEnabled, playerStatus, repeatMode, songs]);
 
+  const cover = (<CoverPanel
+              song={displaySong}
+              isPreview={!nowPlayingSong && Boolean(selectedSong)}
+              onEdit={() => {
+                setMetadataDraft(createMetadataDraft(selectedSong));
+                setMetadataStatus(undefined);
+                setIsMetadataEditorOpen(true);
+              }}
+            />);
+  const transport = (<TransportPanel
+              canPlay={songs.length > 0}
+              isLoadingTrack={isLoadingTrack}
+              isShuffleEnabled={isShuffleEnabled}
+              repeatMode={repeatMode}
+              status={playerStatus}
+              onPrimary={() => void primaryTransportAction()}
+              onStop={() => void stop()}
+              onPrevious={() => nextSong(-1)}
+              onNext={() => nextSong(1)}
+              onToggleShuffle={() => setIsShuffleEnabled((enabled) => !enabled)}
+              onToggleRepeat={toggleRepeatMode}
+              onVolume={setVolume}
+              onSeek={seek}
+            />);
+  const library = (<section className="library-panel">
+          <div className="library-toolbar">
+            <button className="utility-button" type="button" disabled={isScanning} onClick={() => void chooseFolder()}>
+              <FolderOpen size={15} />
+              {isScanning ? "Scanning..." : "Import Folder"}
+            </button>
+            <button
+              className="icon-button refresh-button"
+              type="button"
+              title="Rescan music directory"
+              aria-label="Rescan music directory"
+              disabled={isScanning}
+              onClick={() => void rescanFolder()}
+            >
+              <RefreshCw size={14} className={clsx(isScanning && "spin-icon")} />
+            </button>
+            <label className="search-box">
+              <Search size={14} />
+              <input
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.currentTarget.value)}
+                aria-label="Search tracks"
+                placeholder="Search tracks"
+              />
+            </label>
+            <span>
+              {filteredSongs.length}/{songs.length} tracks
+            </span>
+          </div>
+          {scanError && <div className="error-line">{scanError}</div>}
+          <SongTable
+            songs={filteredSongs}
+            selectedSongId={selectedSongId}
+            playingSongId={playerStatus.songId}
+            pendingSongId={pendingSongId}
+            onSelect={handleSongSelect}
+            onPreload={preloadSong}
+            onPlay={handleSongPlay}
+          />
+        </section>);
   return (
     <main className={clsx("app-shell", `theme-${theme}`)}>
-      <section className="player-frame">
+      {theme === "studio" ? (
+        <StudioShell song={displaySong} cover={cover} transport={transport} library={library}
+          isEmpty={songs.length === 0} isScanning={isScanning} mode={visualizerMode}
+          onImport={() => void chooseFolder()} onMode={setVisualizerMode}
+          onRetro={() => setTheme("lapis")} onSettings={() => setIsSettingsOpen(true)}
+          visualizer={<VisualizerRack frameRef={canvasFrameRef} mode={visualizerMode} theme={theme} />} />
+      ) : <section className="player-frame">
         <header className="title-strip">
           <div className="brand-lockup">
             <Waves size={15} />
@@ -523,30 +633,8 @@ function App() {
 
         <div className="deck-grid">
           <aside className="left-rack">
-            <CoverPanel
-              song={displaySong}
-              isPreview={!nowPlayingSong && Boolean(selectedSong)}
-              onEdit={() => {
-                setMetadataDraft(createMetadataDraft(selectedSong));
-                setMetadataStatus(undefined);
-                setIsMetadataEditorOpen(true);
-              }}
-            />
-            <TransportPanel
-              canPlay={songs.length > 0}
-              isLoadingTrack={isLoadingTrack}
-              isShuffleEnabled={isShuffleEnabled}
-              repeatMode={repeatMode}
-              status={playerStatus}
-              onPrimary={() => void primaryTransportAction()}
-              onStop={() => void stop()}
-              onPrevious={() => nextSong(-1)}
-              onNext={() => nextSong(1)}
-              onToggleShuffle={() => setIsShuffleEnabled((enabled) => !enabled)}
-              onToggleRepeat={toggleRepeatMode}
-              onVolume={setVolume}
-              onSeek={seek}
-            />
+            {cover}
+            {transport}
           </aside>
 
           <VisualizerRack
@@ -556,46 +644,10 @@ function App() {
           />
         </div>
 
-        <section className="library-panel">
-          <div className="library-toolbar">
-            <button className="utility-button" type="button" onClick={() => void chooseFolder()}>
-              <FolderOpen size={15} />
-              {isScanning ? "Scanning..." : "Import Folder"}
-            </button>
-            <button
-              className="icon-button refresh-button"
-              type="button"
-              title="Rescan music directory"
-              aria-label="Rescan music directory"
-              disabled={isScanning}
-              onClick={() => void rescanFolder()}
-            >
-              <RefreshCw size={14} className={clsx(isScanning && "spin-icon")} />
-            </button>
-            <label className="search-box">
-              <Search size={14} />
-              <input
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.currentTarget.value)}
-                placeholder="Search tracks"
-              />
-            </label>
-            <span>
-              {filteredSongs.length}/{songs.length} tracks
-            </span>
-          </div>
-          {scanError && <div className="error-line">{scanError}</div>}
-          <SongTable
-            songs={filteredSongs}
-            selectedSongId={selectedSongId}
-            playingSongId={playerStatus.songId}
-            pendingSongId={pendingSongId}
-            onSelect={handleSongSelect}
-            onPreload={preloadSong}
-            onPlay={handleSongPlay}
-          />
-        </section>
+        {library}
       </section>
+
+      }
 
       {isSettingsOpen && (
         <SettingsModal
@@ -718,7 +770,7 @@ function MetadataEditor({
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section className="metadata-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+      <section className="metadata-modal" role="dialog" aria-label="Edit track" aria-modal="true" onClick={(event) => event.stopPropagation()}>
         <header>
           <div className="metadata-heading">
             <PencilLine size={14} />
@@ -776,8 +828,6 @@ const VisualizerRack = memo(function VisualizerRack({
   mode: VisualizerMode;
   theme: AppTheme;
 }) {
-  const frame = useAppStore((state) => state.visualizerFrame);
-
   return (
     <section className={clsx("visualizer-rack", `visual-mode-${mode}`)}>
       <VisualizerCanvas
@@ -785,20 +835,18 @@ const VisualizerRack = memo(function VisualizerRack({
         mode={mode}
         theme={theme}
       />
-      <SideMeter frame={frame} side="left" />
-      <SideMeter frame={frame} side="right" />
+      {theme !== "studio" && <StereoMeters />}
       <div className="visualizer-label">
         {getVisualizerLabel(mode)}
-      </div>
-      <div className="meter-row">
-        <Meter label="Bass" value={frame?.bass ?? 0} />
-        <Meter label="Pulse" value={frame?.bassPulse ?? 0} />
-        <Meter label="Vocal" value={frame?.mids ?? 0} />
-        <Meter label="Treble" value={frame?.treble ?? 0} />
       </div>
     </section>
   );
 });
+
+function StereoMeters() {
+  const frame = useAppStore((state) => state.visualizerFrame);
+  return <><SideMeter frame={frame} side="left" /><SideMeter frame={frame} side="right" /></>;
+}
 
 function SideMeter({
   frame,
@@ -845,6 +893,9 @@ function SideMeter({
 
 function getVisualizerLabel(mode: VisualizerMode) {
   switch (mode) {
+    case "aurora": return "Aurora";
+    case "silk": return "Silk";
+    case "halo": return "Halo";
     case "trapNation":
       return "TRAP PULSE FIELD";
     case "wmpRibbons":
@@ -863,6 +914,14 @@ function getVisualizerLabel(mode: VisualizerMode) {
       return "WINDOWS ANALYZER";
     case "waveform":
       return "OSCILLOSCOPE";
+    case "freestyle":
+      return "ALCHEMY FLOW";
+    case "ribbonDance":
+      return "AMBIENCE";
+    case "starTunnel":
+      return "BATTERY SPIRAL";
+    case "phosphorTrails":
+      return "PHOSPHOR TRAILS";
   }
 }
 
@@ -912,6 +971,7 @@ function TransportPanel({
         <span>{formatTime(status.durationSeconds)}</span>
       </div>
       <input
+        aria-label="Playback position"
         className="seek-slider"
         type="range"
         min="0"
@@ -948,16 +1008,16 @@ function TransportPanel({
         >
           <Shuffle size={15} />
         </button>
-        <button className="control-button" type="button" disabled={!canPlay} onClick={onPrevious}>
+        <button className="control-button" type="button" aria-label="Previous track" disabled={!canPlay} onClick={onPrevious}>
           <SkipBack size={16} />
         </button>
-        <button className="control-button primary" type="button" disabled={!canPlay || isLoadingTrack} onClick={onPrimary}>
+        <button className="control-button primary" type="button" aria-label={status.isPlaying ? "Pause" : "Play"} disabled={!canPlay || isLoadingTrack} onClick={onPrimary}>
           {status.isPlaying ? <Pause size={16} /> : <Play size={16} />}
         </button>
-        <button className="control-button" type="button" onClick={onStop}>
+        <button className="control-button" type="button" aria-label="Stop" onClick={onStop}>
           <Square size={14} />
         </button>
-        <button className="control-button" type="button" disabled={!canPlay} onClick={onNext}>
+        <button className="control-button" type="button" aria-label="Next track" disabled={!canPlay} onClick={onNext}>
           <SkipForward size={16} />
         </button>
         <button
@@ -979,6 +1039,7 @@ function TransportPanel({
           min="0"
           max="1"
           step="0.01"
+          aria-label="Volume"
           value={status.volume}
           onChange={(event) => onVolume(Number(event.currentTarget.value))}
         />
@@ -998,6 +1059,7 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
   theme: AppTheme;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [contextGeneration, setContextGeneration] = useState(0);
   const canvasSizeRef = useRef({
     width: 0,
     height: 0,
@@ -1026,12 +1088,37 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const context = canvas.getContext("2d", { alpha: false });
-    if (!context) return;
+    const retroRenderer = isRetroMode(mode) ? createRetroRenderer(canvas, mode, theme) : undefined;
+    const context = retroRenderer ? null : canvas.getContext("2d", { alpha: false });
+    if (!context && !retroRenderer) return;
+    const motionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
+    renderStateRef.current.reducedMotion = motionPreference.matches;
+    const onMotionPreference = () => { renderStateRef.current.reducedMotion = motionPreference.matches; };
+    motionPreference.addEventListener("change", onMotionPreference);
     const activeCanvas = canvas;
     const activeContext = context;
+    const onContextLost = (event: Event) => event.preventDefault();
+    const onContextRestored = () => setContextGeneration(value => value + 1);
+    canvas.addEventListener("webglcontextlost", onContextLost);
+    canvas.addEventListener("webglcontextrestored", onContextRestored);
 
     let animationFrame = 0;
+    // Sleep when there is no new signal; audio arrival and resizing wake us.
+    const wake = () => {
+      if (!animationFrame && !document.hidden) {
+        animationFrame = window.requestAnimationFrame(render);
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = 0;
+      } else {
+        wake();
+      }
+    };
+    renderStateRef.current.lastRenderedTimestamp = -2;
+    renderStateRef.current.lastRenderWallTime = 0;
     let lastDeviceWidth = 0;
     let lastDeviceHeight = 0;
     const syncCanvasSize = () => {
@@ -1046,6 +1133,7 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
         deviceHeight: Math.max(1, Math.round(height * scale)),
         scale,
       };
+      wake();
     };
 
     syncCanvasSize();
@@ -1056,10 +1144,8 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
     window.addEventListener("resize", syncCanvasSize);
 
     function render(now: number) {
-      if (document.visibilityState === "hidden") {
-        animationFrame = window.requestAnimationFrame(render);
-        return;
-      }
+      animationFrame = 0;
+      if (document.hidden) return;
 
       const { width, height, deviceWidth, deviceHeight, scale } = canvasSizeRef.current;
       const needsResize = deviceWidth !== lastDeviceWidth || deviceHeight !== lastDeviceHeight;
@@ -1075,7 +1161,7 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
       if (
         !needsResize &&
         state.lastRenderWallTime > 0 &&
-        now - state.lastRenderWallTime < VISUALIZER_RENDER_INTERVAL_MS
+        now - state.lastRenderWallTime < (state.reducedMotion && isModernMode(mode) ? 125 : VISUALIZER_RENDER_INTERVAL_MS - 0.5)
       ) {
         animationFrame = window.requestAnimationFrame(render);
         return;
@@ -1097,6 +1183,7 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
           state.prevFrame,
           state.nextFrame,
           t,
+          !isModernMode(mode),
         );
       } else {
         displayFrame = state.nextFrame ?? state.prevFrame;
@@ -1105,41 +1192,54 @@ const VisualizerCanvas = memo(function VisualizerCanvas({
       const displayTimestamp = displayFrame?.timestamp ?? -1;
       const useHighFpsSmoothing =
         Boolean(displayFrame) &&
-        (mode === "classicBars" || mode === "windowsScope" || mode === "waveform") &&
+        activeVisualizerIds.includes(mode) &&
         now - state.nextFrameArrival < 250;
-      if (!useHighFpsSmoothing && displayTimestamp === state.lastRenderedTimestamp && !needsResize) {
-        animationFrame = window.requestAnimationFrame(render);
+      if ((!useHighFpsSmoothing || isModernMode(mode)) && displayTimestamp === state.lastRenderedTimestamp && !needsResize) {
         return;
       }
       state.lastRenderedTimestamp = displayTimestamp;
       state.lastRenderWallTime = now;
 
-      activeContext.setTransform(scale, 0, 0, scale, 0, 0);
-      drawVisualizer(
-        activeContext,
-        width,
-        height,
-        displayFrame,
-        mode,
-        theme,
-        state,
-        now,
-      );
+      if (retroRenderer) {
+        retroRenderer.draw(displayFrame, now);
+      } else if (activeContext) {
+        activeContext.setTransform(scale, 0, 0, scale, 0, 0);
+        drawVisualizer(
+          activeContext,
+          width,
+          height,
+          displayFrame,
+          mode,
+          theme,
+          state,
+          now,
+        );
+      }
       animationFrame = window.requestAnimationFrame(render);
     }
 
-    animationFrame = window.requestAnimationFrame(render);
+    visualizerFrameListeners.add(wake);
+    document.addEventListener("visibilitychange", onVisibility);
+    wake();
     return () => {
+      canvas.removeEventListener("webglcontextlost", onContextLost);
+      canvas.removeEventListener("webglcontextrestored", onContextRestored);
+      motionPreference.removeEventListener("change", onMotionPreference);
+      retroRenderer?.dispose();
+      visualizerFrameListeners.delete(wake);
+      document.removeEventListener("visibilitychange", onVisibility);
       window.cancelAnimationFrame(animationFrame);
       resizeObserver?.disconnect();
       window.removeEventListener("resize", syncCanvasSize);
     };
-  }, [mode, theme]);
+  }, [mode, theme, contextGeneration]);
 
-  return <canvas className="visualizer-canvas" ref={canvasRef} />;
+  return <canvas role="img" aria-label={`${getVisualizerLabel(mode)} audio visualizer`} key={`${isRetroMode(mode) ? "gpu" : "2d"}:${contextGeneration}`} className="visualizer-canvas" ref={canvasRef} />;
 });
 
 type VisualizerRenderState = {
+  modernMotion?: ModernMotion;
+  reducedMotion?: boolean;
   smoothedBars: number[];
   peakBars: number[];
   vocalWave: number[];
@@ -1157,6 +1257,8 @@ type VisualizerRenderState = {
   nextFrame?: VisualizerFrame;
   nextFrameArrival: number;
   lastRenderedTimestamp: number;
+  phosphorHistory?: number[][];
+  barLayers?: Array<{ key: string; canvas: HTMLCanvasElement; originX: number }>;
 };
 
 function drawVisualizer(
@@ -1169,6 +1271,11 @@ function drawVisualizer(
   renderState: VisualizerRenderState,
   now: number,
 ) {
+  if (isModernMode(mode)) {
+    drawModernVisualizer(context, width, height, frame, mode,
+      renderState.modernMotion ??= createModernMotion(), renderState.reducedMotion);
+    return;
+  }
   ensureVisualizerStateDefaults(renderState);
   const palette = getPalette(theme);
   const dt = renderState.lastTime > 0 ? Math.min(0.05, (now - renderState.lastTime) / 1000) : 1 / 60;
@@ -1176,7 +1283,6 @@ function drawVisualizer(
   renderState.phase += dt * 1.35;
 
   const { smoothedBars, peakBars } = renderState;
-  context.clearRect(0, 0, width, height);
   context.fillStyle = "#000";
   context.fillRect(0, 0, width, height);
 
@@ -1184,6 +1290,16 @@ function drawVisualizer(
     context.fillStyle = palette.muted;
     context.font = "11px 'Courier New', monospace";
     context.fillText("WAITING FOR PCM SIGNAL", 18, height / 2);
+    return;
+  }
+
+  if (mode === "freestyle" || mode === "ribbonDance" || mode === "starTunnel") {
+    drawRetroVisualizer(context, width, height, frame, mode, renderState.phase, palette);
+    return;
+  }
+
+  if (mode === "phosphorTrails") {
+    drawPhosphorTrails(context, width, height, frame, renderState, palette);
     return;
   }
 
@@ -1300,21 +1416,100 @@ function drawVisualizer(
     const blockCount = smoothed > 0.012
       ? Math.max(1, Math.floor(barHeight / (blockHeight + blockGap)))
       : 0;
-    for (let block = 0; block < blockCount; block += 1) {
-      const y = floorY - (block + 1) * (blockHeight + blockGap);
-      const heat = block / Math.max(1, Math.floor(usableHeight / (blockHeight + blockGap)));
-      const color = getBarColor(palette, mode, heat, index, bins.length);
-      context.shadowColor = color;
-      context.shadowBlur = heat > 0.7 ? 11 : 5;
-      context.fillStyle = color;
-      context.fillRect(x, y, barWidth, blockHeight);
+    // Cache each column at its exact device-pixel alignment. The original
+    // colors, blur radii and block geometry are rasterized only when they change.
+    const scale = context.getTransform().a;
+    const originX = Math.floor((x - 32) * scale) / scale;
+    const key = `${width}:${height}:${scale}:${theme}:${mode}:${blockCount}`;
+    const layers = renderState.barLayers ??= [];
+    let layer = layers[index];
+    if (!layer || layer.key !== key) {
+      const canvas = layer?.canvas ?? document.createElement("canvas");
+      const layerWidth = Math.ceil((barWidth + 65) * scale);
+      const layerHeight = Math.ceil(height * scale);
+      if (canvas.width !== layerWidth) canvas.width = layerWidth;
+      if (canvas.height !== layerHeight) canvas.height = layerHeight;
+      const cached = canvas.getContext("2d")!;
+      cached.setTransform(1, 0, 0, 1, 0, 0);
+      cached.clearRect(0, 0, canvas.width, canvas.height);
+      cached.setTransform(scale, 0, 0, scale, -originX * scale, 0);
+      for (let block = 0; block < blockCount; block += 1) {
+        const y = floorY - (block + 1) * (blockHeight + blockGap);
+        const heat = block / Math.max(1, Math.floor(usableHeight / (blockHeight + blockGap)));
+        const color = getBarColor(palette, mode, heat, index, bins.length);
+        cached.shadowColor = color;
+        cached.shadowBlur = heat > 0.7 ? 11 : 5;
+        cached.fillStyle = color;
+        cached.fillRect(x, y, barWidth, blockHeight);
+      }
+      layer = { key, canvas, originX };
+      layers[index] = layer;
     }
+    context.drawImage(layer.canvas, layer.originX, 0, layer.canvas.width / scale, layer.canvas.height / scale);
 
     context.shadowBlur = 0;
     const peakY = floorY - peakBars[index] * usableHeight - 3;
     context.fillStyle = palette.peak;
     context.fillRect(x, Math.max(10, peakY), barWidth, mode === "windowsScope" ? 1 : 2);
   });
+}
+
+function drawPhosphorTrails(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  frame: VisualizerFrame,
+  state: VisualizerRenderState,
+  palette: ReturnType<typeof getPalette>,
+) {
+  // Reuse the existing logarithmic FFT bins: no second audio analyzer.
+  const history = state.phosphorHistory ??= Array.from({ length: 24 }, () => Array(48).fill(0));
+  const row = history.pop()!;
+  for (let index = 0; index < row.length; index++) {
+    const bin = Math.round(index / (row.length - 1) * Math.max(0, frame.frequencyBins.length - 1));
+    row[index] = frame.frequencyBins[bin] ?? 0;
+  }
+  history.unshift(row);
+  const horizon = height * 0.24;
+  const floor = height * 0.88;
+  const center = width / 2;
+
+  context.strokeStyle = palette.muted;
+  context.lineWidth = 0.7;
+  context.globalAlpha = 0.35;
+  context.beginPath();
+  for (let line = -6; line <= 6; line++) {
+    context.moveTo(center + line * width * 0.022, horizon);
+    context.lineTo(center + line * width * 0.09, floor);
+  }
+  context.stroke();
+  context.globalAlpha = 1;
+
+  for (let depth = history.length - 1; depth >= 0; depth--) {
+    const perspective = 1 - depth / history.length;
+    const spread = width * (0.18 + perspective * 0.68);
+    const baseline = horizon + perspective * perspective * (floor - horizon);
+    const samples = history[depth];
+    context.beginPath();
+    for (let index = 0; index < samples.length; index++) {
+      const x = center - spread / 2 + index / (samples.length - 1) * spread;
+      const y = baseline - Math.pow(samples[index], 0.7) * height * 0.28 * perspective;
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    }
+    // Layered strokes give a phosphor halo without a blur pass per line.
+    context.strokeStyle = depth === 0 ? palette.peak : palette.mid;
+    context.globalAlpha = 0.04 + perspective * 0.09;
+    context.lineWidth = 4;
+    context.stroke();
+    context.globalAlpha = 0.15 + perspective * 0.85;
+    context.lineWidth = depth === 0 ? 1.6 : 0.85;
+    context.stroke();
+  }
+  context.globalAlpha = 0.35 + (frame.bassPulse ?? 0) * 0.65;
+  context.fillStyle = palette.peak;
+  context.fillRect(width * 0.08, height * 0.94, width * 0.84, 1);
+  context.globalAlpha = 1;
 }
 
 function ensureVisualizerStateDefaults(renderState: VisualizerRenderState) {
@@ -2295,6 +2490,7 @@ function interpolateFrameInto(
   prev: VisualizerFrame,
   next: VisualizerFrame,
   t: number,
+  includeSamples = true,
 ): VisualizerFrame {
   const ease = Math.min(1, Math.max(0, t));
   target.timestamp = lerp(prev.timestamp, next.timestamp, ease);
@@ -2305,10 +2501,13 @@ function interpolateFrameInto(
   target.treble = lerp(prev.treble, next.treble, ease);
   target.leftLevel = lerp(prev.leftLevel, next.leftLevel, ease);
   target.rightLevel = lerp(prev.rightLevel, next.rightLevel, ease);
+  // Studio uses only the eight scalar envelopes, not the sample arrays.
+  if (includeSamples) {
   interpolateArrayInto(target.frequencyBins, prev.frequencyBins, next.frequencyBins, ease);
   interpolateArrayInto(target.vocalBins, prev.vocalBins, next.vocalBins, ease);
   interpolateArrayInto(target.waveform, prev.waveform, next.waveform, ease);
   interpolateArrayInto(target.peaks, prev.peaks, next.peaks, ease);
+  }
   return target;
 }
 
@@ -2350,17 +2549,6 @@ function smoothedWaveSample(samples: number[], centerIndex: number, radius: numb
     weightTotal += weight;
   }
   return total / Math.max(1, weightTotal);
-}
-
-function Meter({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="meter">
-      <span>{label}</span>
-      <div>
-        <i style={{ width: `${Math.round(value * 100)}%` }} />
-      </div>
-    </div>
-  );
 }
 
 const SongTable = memo(function SongTable({
@@ -2444,11 +2632,11 @@ function SettingsModal({
 }) {
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <section className="settings-modal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+      <section className="settings-modal" role="dialog" aria-label="Settings" aria-modal="true" onClick={(event) => event.stopPropagation()}>
         <header>
           <strong>Settings</strong>
-          <button className="icon-button" type="button" onClick={onClose}>
-            x
+          <button className="icon-button" type="button" aria-label="Close settings" onClick={onClose}>
+            <X size={18} />
           </button>
         </header>
         <div className="settings-group">

@@ -1,0 +1,5 @@
+<!doctype html><title>Library scroll check</title><div id="root"></div><script type="module">
+import React from 'react';import{createRoot}from'react-dom/client';import App from '/src/App.tsx';import{useAppStore}from'/src/store.ts';
+useAppStore.setState({theme:'studio',songs:Array.from({length:120},(_,i)=>({id:String(i),fileName:`Test track ${String(i+1).padStart(3,'0')}`,title:`Test track ${String(i+1).padStart(3,'0')}`,artist:'Scroll test',durationSeconds:180,filePath:'',fileType:'mp3',metadataSource:'test',dateAdded:'',playCount:0}))});
+createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
